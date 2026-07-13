@@ -1,0 +1,14 @@
+LICENSE
+README.md
+pyproject.toml
+python/jaxmetal/__init__.py
+python/jaxmetal/_capi.py
+python/jaxmetal/data.py
+python/jaxmetal/ffi.py
+python/jaxmetal/reference.py
+python/jaxmetal.egg-info/PKG-INFO
+python/jaxmetal.egg-info/SOURCES.txt
+python/jaxmetal.egg-info/dependency_links.txt
+python/jaxmetal.egg-info/requires.txt
+python/jaxmetal.egg-info/top_level.txt
+python/jaxmetal/plugin/__init__.py

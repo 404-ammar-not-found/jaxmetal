@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: build + test (Apple Silicon)
+    runs-on: macos-14   # arm64, Metal-capable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake + Ninja
+        run: brew install cmake ninja
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy "jax[cpu]"
+
+      - name: Configure (with XLA FFI handler)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DJAX_FFI_INCLUDE_DIR=$(python -c "import jax.ffi; print(jax.ffi.include_dir())")
+
+      - name: Build
+        run: cmake --build build
+
+      - name: C++ unit tests (kernels + runtime + MLP)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Python — golden reference vs jax.grad
+        run: python python/jaxmetal/reference.py
+
+      - name: Python — matmul front-end vs jnp.matmul
+        run: python tests/python/test_frontend.py
+
+      - name: Python — resident MLP gate vs golden reference (network-free)
+        run: python tests/python/test_mlp_gate.py

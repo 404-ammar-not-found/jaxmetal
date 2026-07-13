@@ -1,0 +1,251 @@
+Metadata-Version: 2.4
+Name: jaxmetal
+Version: 0.1.0
+Summary: Run JAX workloads on the Apple GPU through hand-written Metal kernels (matmul + resident MLP training).
+Author: Ammar
+License: MIT License
+        
+        Copyright (c) 2026 Ammar
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Project-URL: Homepage, https://github.com/ammar/jaxmetal
+Project-URL: Documentation, https://github.com/ammar/jaxmetal/blob/main/docs/ARCHITECTURE.md
+Keywords: jax,metal,apple-silicon,gpu,mps,compiler,kernels
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: C++
+Classifier: Environment :: GPU
+Classifier: Operating System :: MacOS :: MacOS X
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: <3.13,>=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.24
+Provides-Extra: jax
+Requires-Dist: jax[cpu]>=0.4; extra == "jax"
+Provides-Extra: dev
+Requires-Dist: jax[cpu]>=0.4; extra == "dev"
+Requires-Dist: pytest>=7; extra == "dev"
+Dynamic: license-file
+
+# jax-metal-prototype
+
+Running **JAX matmul on the Apple GPU** through hand-written Metal — a from-scratch,
+learning-focused prototype that grows toward a real JAX backend for Apple Silicon.
+
+It ships three matmul backends behind one JAX-friendly API, and two ways to call them
+natively from JAX:
+
+```python
+import jaxmetal
+c = jaxmetal.matmul(a, b, device="mps")   # "mps" | "metal" | "cpu" | "auto"
+```
+
+```python
+import jaxmetal.ffi as jf                 # runs INSIDE jax.jit (XLA FFI custom call)
+
+@jax.jit
+def model(a, b):
+    c = jf.matmul(a, b)                   # Metal (MPS) matmul as a native custom call
+    return jnp.tanh(c) + 1.0             # composes with normal JAX ops
+```
+
+Everything is bit-exact against `jnp.matmul`.
+
+---
+
+## The headline finding
+
+> On an Apple M4 Pro, for **f32 matmul**, the GPU only beats the CPU when operands are
+> **resident on the GPU** — because Apple's CPU BLAS (Accelerate/AMX) is *very* strong,
+> and per-call host↔GPU copies otherwise erase the GPU's advantage.
+
+Compute-only GFLOP/s (GPU-resident operands), measured by `examples/03_resident_speed.py`:
+
+| N | MPS (GPU) | our hand kernel | Accelerate (CPU) | MPS / CPU |
+|---|---|---|---|---|
+| 512 | 557 | 1043 | 1409 | 0.40× |
+| 1024 | 1472 | 1786 | 3091 | 0.48× |
+| 2048 | 5106 | 2176 | 3212 | **1.59×** |
+| 4096 | 5484 | 2171 | 3130 | **1.75×** |
+
+Three takeaways, all in the code and docs:
+
+1. **MPS beats the CPU from N≈2048 (1.5–1.8×)** — but only for resident operands. This
+   is exactly why PyTorch/JAX keep tensors on-device instead of auto-routing per op, and
+   why the endgame is a real device (the PJRT plugin), not a per-call wrapper.
+2. **Apple's `MPSMatrixMultiplication` (~5.5 TFLOP/s) is what PyTorch MPS uses** and is
+   ~2.5× our hand-written kernel — Apple GPUs have no f32 matrix unit, so the win is pure
+   microarchitecture tuning (optimal tiling, double-buffering) we don't fully replicate.
+3. **Our hand kernel reaches ~2.2 TFLOP/s** from scratch; the big levers were
+   occupancy-aware register blocking (4×4 micro-tiles; 8×8 over-spilled and was *slower*)
+   and `float4` vectorization. See `kernels/matmul.metal`.
+
+---
+
+## Quickstart
+
+Requirements: macOS on Apple Silicon, Xcode Command Line Tools, Homebrew.
+
+```bash
+# 1. Build tools + a JAX-compatible Python env (system Python is too new for jaxlib)
+brew install cmake ninja
+uv venv --python 3.12 .venv
+uv pip install --python .venv numpy "jax[cpu]"
+
+# 2. Build the native library (with the XLA FFI handler enabled)
+cmake -S . -B build -G Ninja \
+  -DJAX_FFI_INCLUDE_DIR=$(.venv/bin/python -c "import jax.ffi; print(jax.ffi.include_dir())")
+cmake --build build          # -> build/libmetal_capi.dylib
+
+# 3. Run the examples
+.venv/bin/python examples/01_backends_and_batching.py
+.venv/bin/python examples/02_jit_ffi.py
+.venv/bin/python examples/03_resident_speed.py
+
+# 4. Tests
+ctest --test-dir build --output-on-failure     # 33 C++ unit tests (kernels + runtime)
+.venv/bin/python python/test_jaxmetal.py        # jaxmetal vs jnp.matmul, all shapes
+```
+
+---
+
+## Examples
+
+| file | shows |
+|---|---|
+| [`examples/01_backends_and_batching.py`](examples/01_backends_and_batching.py) | `jaxmetal.matmul(device=...)` on each backend; full `jnp.matmul` batching/broadcast |
+| [`examples/02_jit_ffi.py`](examples/02_jit_ffi.py) | Metal matmul running **inside `jax.jit`** via an XLA FFI custom call |
+| [`examples/03_resident_speed.py`](examples/03_resident_speed.py) | the GPU-vs-CPU crossover (MPS resident vs Accelerate) |
+
+### 1. Backends + batching
+
+```python
+import jaxmetal
+jaxmetal.matmul(a, b, device="mps")     # Apple's MPS kernel (fastest GPU path)
+jaxmetal.matmul(a, b, device="metal")   # our from-scratch MSL kernel
+jaxmetal.matmul(a, b, device="cpu")     # Accelerate/BLAS
+jaxmetal.matmul(a, b, device="auto")    # size-based router (default)
+
+jaxmetal.matmul(x4d, y3d)               # batched + broadcasting, like jnp.matmul
+```
+
+### 2. Native `jax.jit` integration (XLA FFI)
+
+`jaxmetal.ffi.matmul` lowers to an XLA FFI custom call, so it traces and composes
+inside `jax.jit` with the rest of your program. (Runs on the CPU backend and copies to
+the GPU per call — native *integration*, not yet a native *device*.)
+
+### 3. `device="mps"` — the honest caveat
+
+JAX ops don't take a `device=` kwarg; placement comes from where an array lives plus a
+backend device. So `jaxmetal.matmul(device=...)` is an eager convenience wrapper, and
+`jaxmetal.ffi.matmul` is the jit-native path. A true `mps` **device**
+(`jax.device_put(x, mps)` keeping arrays GPU-resident) is the **PJRT plugin** — see
+[`docs/PJRT_PLUGIN.md`](docs/PJRT_PLUGIN.md).
+
+---
+
+## How it fits together
+
+```
+JAX  ──►  jaxmetal (Python front-end: device=, batching, jax.jit/FFI)
+             │
+             ▼
+          metalmm  (ctypes binding)
+             │
+             ▼
+   libmetal_capi.dylib  (flat C ABI: matmul / mps / cpu / auto / resident / FFI handler)
+             │
+             ▼
+        metal_rt  (C++/Obj-C++ runtime)
+        ├─ ops/matmul       hand-written register-tiled MSL kernel  ("metal")
+        ├─ ops/mps_matmul   MPSMatrixMultiplication                 ("mps")
+        ├─ cpu/cpu_matmul   Accelerate cblas_sgemm                  ("cpu")
+        ├─ ops/elementwise  add/sub/mul/div/max/min, neg/abs/exp
+        ├─ metal/…          MTLDevice, MTLBuffer, runtime MSL compile + pipeline cache
+        └─ runtime/…        1-D and threadgroup dispatch
+```
+
+- **Kernels** (`kernels/*.metal`) are compiled at runtime (`newLibraryWithSource:`) with
+  *safe math*, so f32 results match the CPU/JAX bit-for-bit.
+- **Two JAX integration paths**: XLA FFI custom call (works today) and a PJRT plugin
+  (scaffolded — the native device).
+
+## Repo layout
+
+```
+kernels/        hand-written MSL (elementwise, matmul)
+src/
+  metal/        MetalContext, MetalBuffer, KernelLibrary (runtime MSL compile + cache)
+  runtime/      Dispatcher (1-D + threadgroup grids)
+  ops/          matmul (MSL), mps_matmul (MPS), elementwise
+  cpu/          cpu_matmul (Accelerate)
+  capi/         metal_capi — flat C ABI + auto router
+  ffi/          metal_ffi — XLA FFI custom-call handler (jax.jit integration)
+python/
+  jaxmetal/     JAX-facing front-end (matmul device=, batching, .ffi jit path)
+  metalmm/      low-level ctypes binding (+ resident DeviceBuffer)
+  jax_metal_plugin/  PJRT registration scaffold (Stage 3)
+examples/       runnable examples (start here)
+benchmarks/     bench_matmul.py — MPS vs hand-kernel vs CPU
+tests/cpp/      33 C++ unit tests (per-TEST ctest cases)
+docs/           PJRT_PLUGIN.md — the native-device roadmap
+CLAUDE.md       full engineering notes / ground truth
+```
+
+## Training an MLP on MNIST — on the GPU, faster than CPU
+
+Beyond matmul, the runtime now trains a real neural net. A `784→H→10` MLP (ReLU,
+softmax cross-entropy, plain SGD) runs its **entire** forward + backward + weight
+update **on the Apple GPU**, with all weights, activations, and gradients kept
+**resident** across the SGD loop — the whole step is encoded into a single Metal
+command buffer (MPS matmuls + hand-written NN kernels in
+[`kernels/nn.metal`](kernels/nn.metal), one commit/one sync).
+
+```bash
+.venv/bin/python python/mlp_mnist.py --batch 512 --hidden 1024 --lr 0.5 --epochs 25
+```
+
+- **Trains to ~98.1% MNIST test accuracy** (crosses 97% by epoch 5).
+- **Faster than the equivalent JAX-CPU `jax.jit` step at batch ≥ 512** — 1.3× at
+  B=512, 1.8× at B=1024, **2.7×** at B=2048/H=2048 (~4 TFLOP/s). Below B≈512 the
+  ~15 small per-step kernel dispatches dominate and the CPU wins — the same
+  residency/scale lesson as the matmul crossover above.
+- **Numerically matches a NumPy golden reference** (itself matching `jax.grad` to
+  ~1e-8) to ~1e-7 — enforced by a correctness gate before every run.
+
+`python/mlp_mnist.py` runs a correctness gate, a GPU-vs-JAX-CPU benchmark, and the
+training loop; the resident MLP lives behind a flat C-ABI (`metal_mlp_*` in
+[`src/capi/metal_capi.h`](src/capi/metal_capi.h)) driven from Python via ctypes
+([`python/metalmm`](python/metalmm)). This is the Stage-4 *learning* milestone via a
+direct resident C-ABI; a real `jax.jit(f, backend='metal')` device is still the PJRT
+roadmap ([`docs/PJRT_PLUGIN.md`](docs/PJRT_PLUGIN.md)).
+
+## Status
+
+Working today: hand-written Metal kernels (elementwise + matmul + NN ops), MPS +
+Accelerate backends, a JAX front-end with full `jnp.matmul` semantics, **native
+`jax.jit` integration via XLA FFI**, and a **resident-GPU MLP that trains MNIST to
+~98% faster than JAX-CPU**. In progress: the **PJRT plugin** for a real `mps` device
+(`jax.devices("metal")`) — roadmap and scaffold in
+[`docs/PJRT_PLUGIN.md`](docs/PJRT_PLUGIN.md).
+
+See [`python/README.md`](python/README.md) for the Python API in depth and
+[`CLAUDE.md`](CLAUDE.md) for the full engineering log.

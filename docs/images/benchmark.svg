@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 400" font-family="-apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-label="Resident GPU MLP training step versus JAX-CPU, speedup across batch sizes">
+  <rect x="0" y="0" width="720" height="400" rx="12" fill="#0d1117" stroke="#30363d"/>
+  <text x="32" y="42" fill="#e6edf3" font-size="20" font-weight="700">Resident GPU MLP step vs JAX-CPU</text>
+  <text x="32" y="64" fill="#8b949e" font-size="13">Apple M4 Pro · f32 · hidden=1024 · wall-clock speedup per SGD step (higher = GPU faster)</text>
+
+  <!-- gridlines + y ticks (0..2.2, px/unit=113.6, y0=320) -->
+  <g stroke="#21262d" stroke-width="1">
+    <line x1="90" y1="263.2" x2="690" y2="263.2"/>
+    <line x1="90" y1="149.6" x2="690" y2="149.6"/>
+    <line x1="90" y1="92.8"  x2="690" y2="92.8"/>
+  </g>
+  <g fill="#8b949e" font-size="12" text-anchor="end">
+    <text x="82" y="324">0×</text>
+    <text x="82" y="267">0.5×</text>
+    <text x="82" y="210">1×</text>
+    <text x="82" y="153">1.5×</text>
+    <text x="82" y="96">2×</text>
+  </g>
+
+  <!-- parity line at 1.0x -->
+  <line x1="90" y1="206.4" x2="690" y2="206.4" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="686" y="200" fill="#f85149" font-size="11" text-anchor="end">parity (1.0×)</text>
+
+  <!-- bars: amber = CPU wins, teal = GPU wins -->
+  <g>
+    <rect x="120" y="265.5" width="60" height="54.5"  rx="3" fill="#d29922"/>
+    <rect x="240" y="207.5" width="60" height="112.5" rx="3" fill="#d29922"/>
+    <rect x="360" y="143.9" width="60" height="176.1" rx="3" fill="#2dd4bf"/>
+    <rect x="480" y="113.2" width="60" height="206.8" rx="3" fill="#2dd4bf"/>
+    <rect x="600" y="92.7"  width="60" height="227.3" rx="3" fill="#2dd4bf"/>
+  </g>
+  <!-- value labels -->
+  <g fill="#e6edf3" font-size="13" font-weight="600" text-anchor="middle">
+    <text x="150" y="258">0.48×</text>
+    <text x="270" y="200">0.99×</text>
+    <text x="390" y="136">1.55×</text>
+    <text x="510" y="106">1.82×</text>
+    <text x="630" y="85">2.00×</text>
+  </g>
+  <!-- x axis -->
+  <line x1="90" y1="320" x2="690" y2="320" stroke="#484f58" stroke-width="1.5"/>
+  <g fill="#8b949e" font-size="12" text-anchor="middle">
+    <text x="150" y="340">128</text>
+    <text x="270" y="340">256</text>
+    <text x="390" y="340">512</text>
+    <text x="510" y="340">1024</text>
+    <text x="630" y="340">2048</text>
+    <text x="390" y="366" fill="#6e7681">batch size</text>
+  </g>
+
+  <text x="32" y="392" fill="#6e7681" font-size="11">GPU wins from batch ≥ 512 (up to 2× at 2048). Below 256, per-step kernel-dispatch overhead lets the CPU win.</text>
+</svg>

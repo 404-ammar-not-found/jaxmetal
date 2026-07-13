@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jaxmetal"
+version = "0.1.0"
+description = "Run JAX workloads on the Apple GPU through hand-written Metal kernels (matmul + resident MLP training)."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { file = "LICENSE" }
+authors = [{ name = "Ammar" }]
+keywords = ["jax", "metal", "apple-silicon", "gpu", "mps", "compiler", "kernels"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Environment :: GPU",
+    "Operating System :: MacOS :: MacOS X",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# jaxlib arm64 wheels for macOS exist for CPython 3.10-3.12.
+jax = ["jax[cpu]>=0.4"]
+dev = ["jax[cpu]>=0.4", "pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/ammar/jaxmetal"
+Documentation = "https://github.com/ammar/jaxmetal/blob/main/docs/ARCHITECTURE.md"
+
+# The native extension (libmetal_capi.dylib) is built with CMake/Ninja, not by
+# setuptools — see README "Build". This package is the pure-Python front-end +
+# ctypes binding, which loads that dylib at import time.
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["jaxmetal*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
