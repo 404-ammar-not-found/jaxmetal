@@ -27,10 +27,18 @@ void KernelLibrary::add_source(const std::string& name, const std::string& msl) 
   NSString* src = [NSString stringWithUTF8String:msl.c_str()];
   MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
   // Disable fast-math so arithmetic (notably division) is IEEE-correct and
-  // matches the JAX CPU reference. (Targets macOS 15+ / Metal 4, see CLAUDE.md.)
+  // matches the JAX CPU reference. `mathMode`/`MTLMathModeSafe` only exist in
+  // the macOS 15+ SDK; older SDKs (e.g. Xcode 15.4 CI) fall back to the
+  // deprecated-but-equivalent `fastMathEnabled = NO`.
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15.0, *)) {
     opts.mathMode = MTLMathModeSafe;
+  } else {
+    opts.fastMathEnabled = NO;
   }
+#else
+  opts.fastMathEnabled = NO;
+#endif
   id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
   if (!lib) {
     std::string msg = "Failed to compile MSL module '" + name + "': " +
