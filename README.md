@@ -4,7 +4,6 @@
 
 **Run JAX workloads on the Apple GPU through hand-written Metal — including a full MLP that trains on MNIST, on-device and faster than CPU.**
 
-[![CI](https://github.com/ammar/jaxmetal/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-macOS%20·%20Apple%20Silicon-black)
 ![Stack](https://img.shields.io/badge/C%2B%2B17%20·%20Metal%20·%20MPS%20·%20Python-blue)
 ![Tests](https://img.shields.io/badge/tests-46%20C%2B%2B%20%2B%20python%20gate-brightgreen)
@@ -37,7 +36,7 @@ result is checked against a NumPy/`jax.grad` golden reference to ~1e-7.
 - ⚡ **Faster than CPU where it counts** — up to **2.0×** at batch 2048; the whole
   training step is scheduled into **one Metal command buffer** (one commit, one sync).
 - 🔬 **Numerically honest** — a pure-NumPy golden reference matches `jax.grad` to ~1e-8; the
-  GPU matches that reference to ~1e-7, gated before every run and in CI.
+  GPU matches that reference to ~1e-7, gated before every run.
 - 🛠️ **Hand-written MSL kernels** — register-tiled GEMM, axis reductions, transpose, fused
   numerically-stable softmax cross-entropy, ReLU/grad, SGD — each unit-tested vs a
   double-precision CPU reference (**46 C++ tests**).

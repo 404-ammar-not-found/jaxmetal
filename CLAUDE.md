@@ -59,7 +59,7 @@ ctest --test-dir build -R MatmulTiled -V      # run a single test by its TEST(Na
 .venv/bin/python examples/train_mnist.py --bench-only --batch 1024 --hidden 1024   # GPU vs JAX-CPU step
 .venv/bin/python examples/train_mnist.py --batch 512 --hidden 1024 --lr 0.5 --epochs 25  # ~98.1% acc
 .venv/bin/python python/jaxmetal/reference.py                  # verify the golden ref vs jax.grad
-.venv/bin/python tests/python/test_mlp_gate.py                 # network-free GPU-vs-ref gate (CI)
+.venv/bin/python tests/python/test_mlp_gate.py                 # network-free GPU-vs-ref gate
 ```
 
 > **Layout note (post-restructure):** C++ namespace is `jaxmetal` (was `mtlrt`); public headers
@@ -315,17 +315,15 @@ string via `cmake/EmbedMetal.cmake`. Tests in `tests/cpp/` use a dependency-free
 3. **End-to-end via JAX** (Stage 3): `jax.jit(f, backend='metal')` vs CPU backend.
 4. **Training correctness** (Stage 4): value_and_grad + SGD; loss trajectory tracks CPU.
 
-**CI coverage caveat (load-bearing).** GitHub-hosted macOS runners (`macos-14` in
-`.github/workflows/ci.yml`) are virtualized and expose **no Metal GPU** —
-`MTLCreateSystemDefaultDevice()` returns null. GPU-dependent C++ tests therefore **skip** on CI
-rather than fail: `MetalContext` throws `jaxmetal::MetalUnavailable`, the test harness reports
-`[ SKIP ]` and returns `125`, and each CTest case carries `SKIP_RETURN_CODE 125` (set in
-`CMakeLists.txt`). So a green CI run means the **CPU** tests (`CpuMatmul*`, `MissingKernelThrows`)
-plus the **Python parity gates** (`reference.py`, `test_frontend.py`, `test_mlp_gate.py`) passed —
-it does **not** exercise any Metal kernel. **GPU regressions are only caught locally** (`ctest` on
-the M4 Pro, where all 46 run for real). To get real GPU coverage in CI, add a **self-hosted
-macOS runner with a GPU**; until then, treat the local `ctest` run as the authoritative GPU gate
-and lean on the Python gates for what CI can verify.
+**GPU coverage caveat (load-bearing).** There is **no CI pipeline** — verification runs
+**locally only**. Any hosted macOS runner (e.g. GitHub-hosted `macos-14`) would be virtualized and
+expose **no Metal GPU** (`MTLCreateSystemDefaultDevice()` returns null), so GPU-dependent C++ tests
+would **skip** rather than fail: `MetalContext` throws `jaxmetal::MetalUnavailable`, the test
+harness reports `[ SKIP ]` and returns `125`, and each CTest case carries `SKIP_RETURN_CODE 125`
+(set in `CMakeLists.txt`). **GPU regressions are only caught locally** (`ctest` on the M4 Pro, where
+all 46 run for real). Treat the local `ctest` run as the authoritative GPU gate and the Python
+parity gates (`reference.py`, `test_frontend.py`, `test_mlp_gate.py`) as the fast correctness check.
+To get real GPU coverage in an automated pipeline, add a **self-hosted macOS runner with a GPU**.
 
 ## 9. Open decisions to confirm before Stage 0
 - Exact `jaxlib` version to pin (latest 0.6.x with a 3.11/3.12 arm64 wheel unless told otherwise).
