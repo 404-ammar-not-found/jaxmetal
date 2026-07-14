@@ -105,5 +105,8 @@ foreach(_f ${TEST_SRCS})
   foreach(_line ${_hits})
     string(REGEX REPLACE "^TEST\\(([A-Za-z0-9_]+)\\).*" "\\1" _name "${_line}")
     add_test(NAME ${_name} COMMAND kernel_tests ${_name})
+    # kernel_tests returns 125 when a case skips because no Metal GPU is present
+    # (e.g. headless CI runners) — mark it Skipped, not Failed.
+    set_tests_properties(${_name} PROPERTIES SKIP_RETURN_CODE 125)
   endforeach()
 endforeach()

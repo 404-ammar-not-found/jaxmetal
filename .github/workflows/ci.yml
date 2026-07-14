@@ -9,7 +9,9 @@ on:
 jobs:
   build-and-test:
     name: build + test (Apple Silicon)
-    runs-on: macos-14   # arm64, Metal-capable
+    runs-on: macos-14   # arm64. NOTE: GitHub-hosted runners are virtualized and
+                        # expose NO Metal GPU, so GPU tests SKIP here (see
+                        # SKIP_RETURN_CODE in CMakeLists.txt); CPU tests run for real.
     steps:
       - uses: actions/checkout@v4
 

@@ -315,6 +315,18 @@ string via `cmake/EmbedMetal.cmake`. Tests in `tests/cpp/` use a dependency-free
 3. **End-to-end via JAX** (Stage 3): `jax.jit(f, backend='metal')` vs CPU backend.
 4. **Training correctness** (Stage 4): value_and_grad + SGD; loss trajectory tracks CPU.
 
+**CI coverage caveat (load-bearing).** GitHub-hosted macOS runners (`macos-14` in
+`.github/workflows/ci.yml`) are virtualized and expose **no Metal GPU** —
+`MTLCreateSystemDefaultDevice()` returns null. GPU-dependent C++ tests therefore **skip** on CI
+rather than fail: `MetalContext` throws `jaxmetal::MetalUnavailable`, the test harness reports
+`[ SKIP ]` and returns `125`, and each CTest case carries `SKIP_RETURN_CODE 125` (set in
+`CMakeLists.txt`). So a green CI run means the **CPU** tests (`CpuMatmul*`, `MissingKernelThrows`)
+plus the **Python parity gates** (`reference.py`, `test_frontend.py`, `test_mlp_gate.py`) passed —
+it does **not** exercise any Metal kernel. **GPU regressions are only caught locally** (`ctest` on
+the M4 Pro, where all 46 run for real). To get real GPU coverage in CI, add a **self-hosted
+macOS runner with a GPU**; until then, treat the local `ctest` run as the authoritative GPU gate
+and lean on the Python gates for what CI can verify.
+
 ## 9. Open decisions to confirm before Stage 0
 - Exact `jaxlib` version to pin (latest 0.6.x with a 3.11/3.12 arm64 wheel unless told otherwise).
 - First model: MLP/MNIST (default) vs the smaller `relu(x @ W)` starter for Stage 2.

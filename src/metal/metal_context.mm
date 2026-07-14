@@ -13,7 +13,7 @@ struct MetalContext::Impl {
 
 MetalContext::MetalContext() : impl_(std::make_unique<Impl>()) {
   impl_->device = MTLCreateSystemDefaultDevice();
-  if (!impl_->device) throw std::runtime_error("No Metal device found");
+  if (!impl_->device) throw MetalUnavailable("No Metal device found");
   impl_->queue = [impl_->device newCommandQueue];
   if (!impl_->queue) throw std::runtime_error("Failed to create MTLCommandQueue");
 }

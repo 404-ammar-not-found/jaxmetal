@@ -3,12 +3,20 @@
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace jaxmetal {
 
 class MetalBuffer;
+
+// Thrown when no Metal GPU device is available (e.g. a headless/virtualized CI
+// runner). Distinct type so callers — notably the test harness — can treat a
+// missing device as "skip", separate from a genuine runtime failure.
+struct MetalUnavailable : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
 // Owns the single MTLDevice + MTLCommandQueue used by the runtime, and is the
 // factory for device buffers. Process-wide singleton for now (one GPU).
