@@ -1,172 +1,198 @@
-<div align="center">
-
 # jaxmetal
 
-**Run JAX workloads on the Apple GPU through hand-written Metal — including a full MLP that trains on MNIST, on-device and faster than CPU.**
+A from-scratch GPU backend for Apple Silicon, written in C++17 and Metal Shading Language. It
+executes general matrix multiplication and a complete neural-network training step (forward,
+backpropagation, and SGD update) on the Apple GPU, with a Python front end that integrates
+with `jax.jit` through an XLA FFI custom call.
 
-![Platform](https://img.shields.io/badge/platform-macOS%20·%20Apple%20Silicon-black)
-![Stack](https://img.shields.io/badge/C%2B%2B17%20·%20Metal%20·%20MPS%20·%20Python-blue)
-![Tests](https://img.shields.io/badge/tests-46%20C%2B%2B%20%2B%20python%20gate-brightgreen)
-![MNIST](https://img.shields.io/badge/MNIST-98.1%25%20test%20acc-brightgreen)
-![License](https://img.shields.io/badge/license-MIT-green)
+![platform](https://img.shields.io/badge/platform-macOS%20·%20Apple%20Silicon-black)
+![stack](https://img.shields.io/badge/C%2B%2B17%20·%20Metal%20·%20MPS%20·%20Python-blue)
+![tests](https://img.shields.io/badge/tests-46%20C%2B%2B%20%2B%20Python%20gate-brightgreen)
+![license](https://img.shields.io/badge/license-MIT-green)
 
-</div>
+Kernels are hand-written; the project does not use MPSGraph or any existing ML framework for
+codegen, scheduling, or autodiff. Every numerical result is validated against a NumPy reference
+implementation that is itself checked against `jax.grad`.
 
-A from-scratch, compiler-level backend that executes matmul **and a complete neural-net
-training step** (forward + backprop + SGD) on Apple Silicon GPUs via hand-written **Metal
-Shading Language** kernels — no MPSGraph, no ML framework, we own codegen and dispatch. Every
-result is checked against a NumPy/`jax.grad` golden reference to ~1e-7.
+## Summary of results
 
-> **Headline:** a `784→1024→10` MLP trains on MNIST **entirely on the M4 Pro GPU** to
-> **98.1% test accuracy**, and its resident training step is **1.3–2.0× faster than the
-> equivalent `jax.jit` step on the CPU** (Accelerate/AMX) — because every tensor stays
-> GPU-resident and the whole step is one Metal command buffer.
+A `784 → 1024 → 10` MLP trains on MNIST entirely on an M4 Pro GPU to **98.1% test accuracy**.
+Its GPU-resident training step is **1.3–2.0× faster than the equivalent `jax.jit` step on the
+CPU** (Accelerate/AMX) at batch sizes of 512 and above. The speedup comes from two design
+decisions: all tensors remain GPU-resident across steps, and the entire step is encoded into a
+single Metal command buffer with one commit and one host synchronisation.
 
 <table>
 <tr>
 <td width="50%"><img src="docs/images/training_curve.svg" alt="MNIST test accuracy per epoch, reaching 98.15%"></td>
-<td width="50%"><img src="docs/images/benchmark.svg" alt="Resident GPU MLP step vs JAX-CPU speedup across batch sizes"></td>
+<td width="50%"><img src="docs/images/benchmark.svg" alt="Resident GPU MLP step versus JAX CPU speedup across batch sizes"></td>
 </tr>
 </table>
 
-## Highlights
+## Capabilities
 
-- 🧠 **Trains a real MLP on MNIST on the GPU** — resident forward + backward + SGD, **98.1%**
-  test accuracy, matching the CPU backend within ±0.5%.
-- ⚡ **Faster than CPU where it counts** — up to **2.0×** at batch 2048; the whole
-  training step is scheduled into **one Metal command buffer** (one commit, one sync).
-- 🔬 **Numerically honest** — a pure-NumPy golden reference matches `jax.grad` to ~1e-8; the
-  GPU matches that reference to ~1e-7, gated before every run.
-- 🛠️ **Hand-written MSL kernels** — register-tiled GEMM, axis reductions, transpose, fused
-  numerically-stable softmax cross-entropy, ReLU/grad, SGD — each unit-tested vs a
-  double-precision CPU reference (**46 C++ tests**).
-- 🔌 **Native `jax.jit` integration** via an XLA FFI custom call; a real `metal` *device*
-  (PJRT) is the documented roadmap.
+- **End-to-end GPU training.** Resident forward pass, backward pass, and SGD update. Final
+  accuracy matches the CPU reference implementation to within ±0.5%.
+- **Verified numerics.** A pure-NumPy golden reference agrees with `jax.grad` to approximately
+  1e-8; the GPU implementation agrees with that reference to approximately 1e-7. The check runs
+  as a gate before every training run.
+- **Hand-written MSL kernel set.** Register-tiled GEMM, axis reductions, transpose, fused
+  numerically stable softmax cross-entropy, ReLU and its gradient, and the SGD update. Each is
+  unit-tested against a double-precision CPU implementation across 46 C++ tests.
+- **JAX integration.** `jaxmetal.ffi.matmul` lowers to an XLA FFI custom call and composes with
+  native JAX operations inside `jax.jit`. A PJRT plugin exposing a real `metal` device is
+  specified but not yet implemented; see [Roadmap](#roadmap).
 
-## Quickstart
+## Requirements
 
-Requires macOS on Apple Silicon + Xcode Command Line Tools + Homebrew. (Full Xcode is *not*
-needed — MSL is compiled at runtime.)
+macOS on Apple Silicon, Xcode Command Line Tools, and Homebrew. Full Xcode is not required, as
+Metal Shading Language is compiled at runtime.
+
+## Build and run
 
 ```bash
-# 1. Toolchain + an isolated, jaxlib-compatible Python (system Python is often too new)
+# 1. Toolchain and an isolated, jaxlib-compatible interpreter.
+#    The system Python is frequently too new for the pinned jaxlib.
 brew install cmake ninja
 uv venv --python 3.12 .venv
 uv pip install --python .venv numpy "jax[cpu]"
 
-# 2. Build the native runtime (with the XLA FFI handler)
+# 2. Build the native runtime, including the XLA FFI handler.
 cmake -S . -B build -G Ninja \
   -DJAX_FFI_INCLUDE_DIR=$(.venv/bin/python -c "import jax.ffi; print(jax.ffi.include_dir())")
 cmake --build build
 
-# 3. Train the MLP on MNIST (gate → benchmark → train), all on the GPU
+# 3. Train the MLP on MNIST: correctness gate, benchmark, then the SGD loop.
 .venv/bin/python examples/train_mnist.py --batch 512 --hidden 1024 --lr 0.5 --epochs 25
 
-# 4. Tests
-ctest --test-dir build --output-on-failure       # 46 C++ unit tests
-.venv/bin/python tests/python/test_mlp_gate.py    # GPU MLP vs golden reference
+# 4. Run the test suites.
+ctest --test-dir build --output-on-failure        # 46 C++ unit tests
+.venv/bin/python tests/python/test_mlp_gate.py    # GPU MLP against the golden reference
 ```
 
-Or install the Python package: `uv pip install --python .venv -e .` → `import jaxmetal`.
+To install the Python package: `uv pip install --python .venv -e .`, then `import jaxmetal`.
 
-## The result
+## Benchmarks
 
-### Trains MNIST on the GPU
+### MNIST training
 
-`examples/train_mnist.py` runs a correctness gate, a GPU-vs-CPU benchmark, and the SGD loop —
-all with weights and activations kept GPU-resident. `784→1024→10`, ReLU, softmax
-cross-entropy, plain SGD:
+`examples/train_mnist.py` runs the correctness gate, a GPU-versus-CPU benchmark, and the
+training loop, holding weights and activations on the GPU throughout. Architecture:
+`784 → 1024 → 10` with ReLU activations, softmax cross-entropy loss, and plain SGD.
 
 ```
-[gate] PASS   (GPU loss/grads match the NumPy golden reference)
+[gate] PASS   (GPU loss and gradients match the NumPy golden reference)
 epoch  5  train_loss=0.0926  test_acc=97.10%
 epoch 15  train_loss=0.0353  test_acc=98.00%
-FINAL test accuracy: 98.12%  best=98.15%   (PASS >=97%)
+FINAL test accuracy: 98.12%  best=98.15%   (PASS >= 97%)
 ```
 
-### Faster than the CPU (resident step, M4 Pro, hidden=1024)
+### Training step latency
 
-| batch | GPU step | JAX-CPU step | speedup |
+Measured on an M4 Pro with `hidden=1024`. Reproduce with
+`examples/train_mnist.py --bench-only --batch <B> --hidden 1024`.
+
+| Batch | GPU step | JAX CPU step | Speedup |
 |------:|---------:|-------------:|:-------:|
 | 128   | 1.41 ms  | 0.68 ms      | 0.48×   |
 | 256   | 1.10 ms  | 1.09 ms      | 0.99×   |
-| 512   | 1.23 ms  | 1.90 ms      | **1.55×** |
-| 1024  | 1.77 ms  | 3.22 ms      | **1.82×** |
-| 2048  | 3.09 ms  | 6.20 ms      | **2.00×** |
+| 512   | 1.23 ms  | 1.90 ms      | 1.55×   |
+| 1024  | 1.77 ms  | 3.22 ms      | 1.82×   |
+| 2048  | 3.09 ms  | 6.20 ms      | 2.00×   |
 
-The GPU wins from batch ≥ 512. Below that, the ~15 small per-step kernel dispatches dominate
-and the CPU (Accelerate/AMX, genuinely multi-threaded) wins — the same data-locality/scale
-lesson that motivates keeping tensors on-device. Reproduce with
-`examples/train_mnist.py --bench-only --batch <B> --hidden 1024`.
+The GPU is faster from batch 512 onward. Below that threshold, the roughly 15 small per-step
+kernel dispatches dominate wall-clock time and the multi-threaded CPU path via Accelerate/AMX
+is the better choice. This is the expected consequence of fixed dispatch overhead against
+insufficient arithmetic intensity, and it is reported here rather than omitted.
 
-## Matmul backends
+### Matrix multiplication
 
-Three matmuls behind one API, plus a compute-only benchmark (`benchmarks/bench_matmul.py`,
-GPU-resident operands, M4 Pro, f32):
+Three backends sit behind one API. Compute-only measurements from
+`benchmarks/bench_matmul.py`, with GPU-resident operands, M4 Pro, f32:
 
-| N | MPS (GF/s) | our MSL kernel | Accelerate CPU | MPS / CPU |
-|--:|-----------:|---------------:|---------------:|:---------:|
+| N | MPS (GFLOP/s) | Hand-written MSL | Accelerate (CPU) | MPS / CPU |
+|--:|--------------:|-----------------:|-----------------:|:---------:|
 | 1024 | 2415 | 1182 | 2272 | 1.06× |
 | 2048 | 3739 | 2105 | 2553 | 1.46× |
-| 4096 | **5358** | 2112 | 3092 | **1.73×** |
+| 4096 | 5358 | 2112 | 3092 | 1.73× |
 
-`jaxmetal.matmul(a, b, device="mps"|"metal"|"cpu"|"auto")` gives `jnp.matmul` semantics
-(1-D/2-D/batched/broadcast) with an explicit backend. Our hand kernel reaches ~40% of MPS —
-occupancy-aware 4×4 register blocking and `float4` vectorization were the big levers; Apple
-GPUs have no f32 matrix unit, so `simdgroup_matrix` gave us nothing.
+`jaxmetal.matmul(a, b, device="mps"|"metal"|"cpu"|"auto")` provides `jnp.matmul` semantics
+(1-D, 2-D, batched, and broadcast cases) with explicit backend selection. The hand-written
+kernel reaches roughly 40% of MPS throughput. Occupancy-aware 4×4 register blocking and
+`float4` vectorisation produced the largest gains; `simdgroup_matrix` produced none, as Apple
+GPUs have no f32 matrix unit.
 
-## How it works
+## Design
 
 ```
-jaxmetal (Python: matmul(device=), Mlp, ffi)  →  ctypes  →  flat C ABI (metal_mlp_*, metal_matmul_*)
-   →  C++ ops (mlp / matmul / mps_matmul / nn / elementwise)  →  Metal runtime
-   (MetalContext · MetalBuffer[unified] · KernelLibrary[runtime MSL compile] · Dispatcher)  →  kernels/*.metal + MPS
+jaxmetal (Python: matmul(device=), Mlp, ffi)  ->  ctypes  ->  flat C ABI (metal_mlp_*, metal_matmul_*)
+   ->  C++ ops (mlp / matmul / mps_matmul / nn / elementwise)  ->  Metal runtime
+   (MetalContext, MetalBuffer [unified], KernelLibrary [runtime MSL compilation], Dispatcher)
+   ->  kernels/*.metal and MPS
 ```
 
-**The core design decision — one command buffer per training step.** The naive path (a
-command buffer per op, plus MPS's own internal `waitUntilCompleted`) incurs ~15 commits and
-5 host stalls per step and *loses* to the CPU. Instead, `train_step` encodes the full
-forward + backward + SGD sequence (MPS GEMMs via `encodeToCommandBuffer:`, custom kernels via
-compute encoders) into a **single command buffer**, commits once, and syncs once — Metal's
-automatic hazard tracking orders the ~19 encoders, and only the scalar loss is read back.
-Backward normalizes every gradient to a plain `[M,K]×[K,N]` GEMM via three explicit transpose
-kernels; the `1/B` averaging is baked once into `dlogits` by the fused softmax-XE kernel.
+**One command buffer per training step.** The naive implementation, allocating a command buffer
+per operation and inheriting MPS's internal `waitUntilCompleted`, incurs roughly 15 commits and
+5 host stalls per step and is slower than the CPU. Instead, `train_step` encodes the full
+forward, backward, and SGD sequence into a single command buffer, using
+`encodeToCommandBuffer:` for MPS GEMMs and compute encoders for the custom kernels. It commits
+once and synchronises once. Metal's automatic hazard tracking orders the roughly 19 encoders,
+and only the scalar loss is read back to the host.
 
-Kernels compile with `MTLMathModeSafe`, so `+ − × ÷` are bit-exact vs the CPU reference — that
-is what makes numerical parity testing possible. Full details in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The backward pass normalises every gradient to a plain `[M,K] × [K,N]` GEMM using three
+explicit transpose kernels. The `1/B` averaging is folded once into `dlogits` inside the fused
+softmax cross-entropy kernel rather than applied as a separate pass.
 
-## Calling it from JAX
+Kernels are compiled with `MTLMathModeSafe`, which makes `+`, `-`, `×`, and `÷` bit-exact
+against the CPU reference. This is what makes strict numerical parity testing feasible, at some
+cost in throughput. Full details are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-- **`jaxmetal.ffi.matmul`** — jittable: lowers to an XLA FFI custom call and composes inside
-  `jax.jit` with native JAX ops (runs on the CPU backend, copies to GPU per call). Native
-  *integration*. Demo: `examples/ffi_jit.py`.
-- **PJRT device** *(roadmap)* — a real `metal` device so `jax.device_put(x, metal)` keeps
-  arrays resident and `jax.jit(f, backend='metal')` runs on the GPU natively (residency, and
-  the win, for free). Scaffold in `jaxmetal.plugin`; see [docs/PJRT_PLUGIN.md](docs/PJRT_PLUGIN.md).
+## Using it from JAX
+
+- **`jaxmetal.ffi.matmul`** is jittable. It lowers to an XLA FFI custom call and composes with
+  native JAX operations inside `jax.jit`. Note the limitation: the surrounding computation runs
+  on the CPU backend, so operands are copied to the GPU on each call. Demonstrated in
+  `examples/ffi_jit.py`.
+- **PJRT device (planned).** A real `metal` device would let `jax.device_put(x, metal)` keep
+  arrays resident and `jax.jit(f, backend='metal')` execute natively on the GPU, providing
+  residency, and therefore the performance win, without manual scheduling. A scaffold exists in
+  `jaxmetal.plugin`; the design is in [docs/PJRT_PLUGIN.md](docs/PJRT_PLUGIN.md).
+
+## Scope and limitations
+
+- f32 only. No mixed precision, and no f16 or bf16 paths.
+- SGD only. No momentum, Adam, or weight decay.
+- The MLP training step is hand-scheduled. Residency is a property of that specific
+  implementation, not a general capability of the backend.
+- The FFI path does not keep data resident across calls; only the hand-written MLP path does.
+- Benchmarks are single-machine results from one M4 Pro and have not been validated across
+  other Apple Silicon configurations.
 
 ## Repository layout
 
 ```
-include/jaxmetal/   public C++ headers (metal/ runtime/ ops/ cpu/ capi/)
-src/                implementations: metal/ runtime/ ops/{matmul,mps_matmul,nn,mlp,…} capi/ ffi/
-kernels/            hand-written MSL: elementwise · matmul · nn  (embedded, compiled at runtime)
-python/jaxmetal/    package: __init__ (public API) · _capi (ctypes) · ffi · data · reference · plugin
-examples/           train_mnist · backends_and_batching · jit_ffi · ffi_jit · resident_speed · matmul_showcase
-benchmarks/         bench_matmul.py (MPS vs hand kernel vs CPU)
-tests/cpp/          46 C++ unit tests (per-TEST ctest cases)      tests/python/  frontend + MLP gate
-docs/               ARCHITECTURE.md · PJRT_PLUGIN.md · images/
+include/jaxmetal/   Public C++ headers (metal/, runtime/, ops/, cpu/, capi/)
+src/                Implementations: metal/, runtime/, ops/{matmul,mps_matmul,nn,mlp,...}, capi/, ffi/
+kernels/            Hand-written MSL: elementwise, matmul, nn (embedded, compiled at runtime)
+python/jaxmetal/    Package: __init__ (public API), _capi (ctypes), ffi, data, reference, plugin
+examples/           train_mnist, backends_and_batching, jit_ffi, ffi_jit, resident_speed, matmul_showcase
+benchmarks/         bench_matmul.py (MPS versus hand-written kernel versus CPU)
+tests/cpp/          46 C++ unit tests, exposed as individual ctest cases
+tests/python/       Front-end tests and the MLP correctness gate
+docs/               ARCHITECTURE.md, PJRT_PLUGIN.md, images/
 ```
 
 ## Roadmap
 
-- **PJRT plugin** — a real `metal` device (`jax.jit(f, backend='metal')`) via a hand-written
-  StableHLO-subset parser → kernel schedule. The residency the MLP builds by hand would then
-  come for free for arbitrary JAX programs.
-- **Kernel fusion** for elementwise chains; a faster hand GEMM (double-buffering); AOT
-  `.metallib` when full Xcode is present.
+- **PJRT plugin.** A real `metal` device supporting `jax.jit(f, backend='metal')`, implemented
+  as a hand-written StableHLO-subset parser that lowers to a kernel schedule. This would extend
+  the residency the MLP currently achieves by hand to arbitrary JAX programs.
+- **Kernel fusion** for elementwise chains.
+- **Faster hand-written GEMM** via double-buffered shared-memory loads.
+- **Ahead-of-time `.metallib` compilation** when full Xcode is available.
 
 ## License
 
-[MIT](LICENSE) © 2026 Ammar. A learning/portfolio project — not affiliated with Apple's
-(abandoned) `jax-metal`.
+[MIT](LICENSE) © 2026 Ammar.
+
+A learning and portfolio project. Not affiliated with Apple's discontinued `jax-metal`.
