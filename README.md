@@ -18,9 +18,9 @@ Shading Language** kernels — no MPSGraph, no ML framework, we own codegen and 
 result is checked against a NumPy/`jax.grad` golden reference to ~1e-7.
 
 > **Headline:** a `784→1024→10` MLP trains on MNIST **entirely on the M4 Pro GPU** to
-> **98.1% test accuracy**, and its resident training step is **1.3–2.0× faster than the
+> **98.15% test accuracy**, and its resident training step is **1.6–3.2× faster than the
 > equivalent `jax.jit` step on the CPU** (Accelerate/AMX) — because every tensor stays
-> GPU-resident and the whole step is one Metal command buffer.
+> GPU-resident *and* many SGD steps share one Metal command buffer.
 
 <table>
 <tr>
@@ -31,9 +31,10 @@ result is checked against a NumPy/`jax.grad` golden reference to ~1e-7.
 
 ## Highlights
 
-- 🧠 **Trains a real MLP on MNIST on the GPU** — resident forward + backward + SGD, **98.1%**
+- 🧠 **Trains a real MLP on MNIST on the GPU** — resident forward + backward + SGD, **98.15%**
   test accuracy, matching the CPU backend within ±0.5%.
-- ⚡ **Faster than CPU where it counts** — up to **2.0×** at batch 2048; the whole
+- ⚡ **Faster than CPU where it counts** — up to **3.2×**; a `device="auto"` router picks the
+  faster arm below the crossover; the whole
   training step is scheduled into **one Metal command buffer** (one commit, one sync).
 - 🔬 **Numerically honest** — a pure-NumPy golden reference matches `jax.grad` to ~1e-8; the
   GPU matches that reference to ~1e-7, gated before every run.
@@ -65,6 +66,7 @@ cmake --build build
 # 4. Tests
 ctest --test-dir build --output-on-failure       # 46 C++ unit tests
 .venv/bin/python tests/python/test_mlp_gate.py    # GPU MLP vs golden reference
+.venv/bin/python tests/python/test_mlp_auto.py    # chunked == per-step; router vs the clock
 ```
 
 Or install the Python package: `uv pip install --python .venv -e .` → `import jaxmetal`.
@@ -84,20 +86,27 @@ epoch 15  train_loss=0.0353  test_acc=98.00%
 FINAL test accuracy: 98.12%  best=98.15%   (PASS >=97%)
 ```
 
-### Faster than the CPU (resident step, M4 Pro, hidden=1024)
+### Faster than the CPU (resident step, M4 Pro)
 
-| batch | GPU step | JAX-CPU step | speedup |
-|------:|---------:|-------------:|:-------:|
-| 128   | 1.41 ms  | 0.68 ms      | 0.48×   |
-| 256   | 1.10 ms  | 1.09 ms      | 0.99×   |
-| 512   | 1.23 ms  | 1.90 ms      | **1.55×** |
-| 1024  | 1.77 ms  | 3.22 ms      | **1.82×** |
-| 2048  | 3.09 ms  | 6.20 ms      | **2.00×** |
+| batch | hidden=128 GPU | CPU | speedup | hidden=1024 GPU | CPU | speedup |
+|------:|---------------:|----:|:-------:|----------------:|----:|:-------:|
+| 32    | 0.124 ms | 0.097 ms | 0.79×     | 0.200 ms | 0.319 ms | **1.60×** |
+| 128   | 0.137 ms | 0.179 ms | **1.31×** | 0.274 ms | 0.664 ms | **2.42×** |
+| 512   | 0.206 ms | 0.446 ms | **2.17×** | 0.605 ms | 1.827 ms | **3.02×** |
+| 2048  | 0.496 ms | 1.382 ms | **2.79×** | 2.023 ms | 6.400 ms | **3.16×** |
 
-The GPU wins from batch ≥ 512. Below that, the ~15 small per-step kernel dispatches dominate
-and the CPU (Accelerate/AMX, genuinely multi-threaded) wins — the same data-locality/scale
-lesson that motivates keeping tensors on-device. Reproduce with
-`examples/train_mnist.py --bench-only --batch <B> --hidden 1024`.
+**Submission overhead, not FLOPs, was the binding constraint.** One command buffer *per step*
+costs a ~140 µs driver round trip plus ~100 µs of CPU-side encoding — a ~0.5 ms floor that
+swamped the compute and kept the GPU behind the CPU until batch ~1000. Batching many SGD steps
+into one command buffer (`train_steps`), caching the MPS objects, using MPS transpose flags
+instead of materialising transposes, coalescing encoders, and parallelising the bias-gradient
+reduction cut per-step time **~4.4×** and moved the crossover to **batch ~60** at hidden=128.
+
+The GPU still loses below that, and that is a real limit rather than a missing optimisation: a
+Metal command buffer round trip cannot go below ~95 µs, while the CPU's entire step at batch 1 is
+~20 µs. So `jaxmetal.Mlp(device="auto")` routes to whichever arm the measured cost model favours —
+`.device` reports the choice, `--calibrate` re-fits it on other hardware. Reproduce with
+`examples/train_mnist.py --bench-only --batch <B> --hidden <H>`.
 
 ## Matmul backends
 

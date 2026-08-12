@@ -22,7 +22,10 @@ def _gate(seed: int, batch: int, hidden: int, lr: float = 0.1) -> None:
     X = (rng.standard_normal((batch, IN_DIM)) * 0.1).astype(np.float32)
     y = rng.integers(0, OUT_DIM, batch).astype(np.int32)
 
-    m = jaxmetal.Mlp(IN_DIM, hidden, OUT_DIM, batch)
+    # device="gpu" explicitly: this gate exists to check the Metal path against the
+    # NumPy reference, and device="auto" would hand back the reference itself at
+    # small batch, making the comparison vacuous.
+    m = jaxmetal.Mlp(IN_DIM, hidden, OUT_DIM, batch, device="gpu")
     m.set_params(params["W1"], params["b1"], params["W2"], params["b2"])
     m.upload_batch(X, y)
 

@@ -21,9 +21,23 @@ class MetalBuffer;
 //
 // Buffers are sized to `max_batch` once; every op takes the runtime batch (<= max)
 // so eval can run trailing partial batches without reallocation.
+//
+// ONE COMMAND BUFFER PER STEP IS NOT ENOUGH. Measured on an M4 Pro, a single
+// commit + waitUntilCompleted round trip costs ~140 us of pure driver latency on
+// top of GPU execution, and the ~100 us of CPU-side encoding cannot overlap it
+// because the host is blocked. At hidden=128 that fixed ~0.42 ms swamped the step
+// until batch ~1000. `upload_chunk` + `train_steps` therefore encode up to
+// `chunk_steps` consecutive SGD steps into ONE command buffer: the round trip is
+// paid once per chunk instead of once per step, and encoding step i+1 overlaps
+// the GPU running step i. Steps stay correctly ordered because Metal hazard-tracks
+// within a command buffer, and each step's SGD update is a read-after-write on the
+// same resident parameter buffers.
 class MLP {
  public:
-  MLP(int64_t in_dim, int64_t hidden, int64_t out_dim, int64_t max_batch);
+  // `chunk_steps` sizes the input/label buffers to hold that many consecutive
+  // minibatches (activations stay sized to one). 1 keeps the old per-step behaviour.
+  MLP(int64_t in_dim, int64_t hidden, int64_t out_dim, int64_t max_batch,
+      int64_t chunk_steps = 1);
   ~MLP();
   MLP(const MLP&) = delete;
   MLP& operator=(const MLP&) = delete;
@@ -48,7 +62,25 @@ class MLP {
   // One SGD step on the uploaded (x, labels): forward -> softmax-xent -> backward
   // -> theta -= lr*grad, all resident in one command buffer. Returns the mean
   // cross-entropy loss over the batch (computed before the update).
+  // Equivalent to train_steps(1, batch, lr) followed by last_loss().
   float train_step(int64_t batch, float lr);
+
+  int64_t chunk_steps() const;
+
+  // Host -> resident buffers for `n_steps` consecutive minibatches laid end to end.
+  // X[n_steps*batch*in_dim] f32 row-major, labels[n_steps*batch] i32.
+  // n_steps <= chunk_steps() and batch <= max_batch().
+  void upload_chunk(const float* X, const int32_t* labels, int64_t n_steps,
+                    int64_t batch);
+
+  // `n_steps` SGD steps over the uploaded chunk (step i takes rows [i*batch,
+  // (i+1)*batch)), all encoded into ONE command buffer with a single host sync at
+  // the end. Read the mean loss over the whole chunk with last_loss().
+  void train_steps(int64_t n_steps, int64_t batch, float lr);
+
+  // Mean cross-entropy over the most recent train_step/train_steps call. Cheap:
+  // the per-step sums were reduced on the GPU and the sync already happened.
+  float last_loss() const;
 
  private:
   struct Impl;

@@ -15,12 +15,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > **A full resident-GPU MLP trainer is now implemented and verified** (the Stage-4 *learning*
 > milestone, reached via a direct **resident C-ABI** path rather than the PJRT device): hand-written
 > MSL NN kernels (`kernels/nn.metal`) + a `mtlrt::MLP` class (`src/ops/mlp.mm`) that runs the entire
-> `784→H→10` forward + backward + SGD step **in one Metal command buffer** (MPS matmuls +
-> custom kernels, one commit/wait, params never leave the GPU). It **trains MNIST to ~98% test
-> accuracy** and its resident step is **faster than the equivalent JAX-CPU `jax.jit` step at batch
-> ≥512** (1.3–2.7×). Numerically it matches a NumPy golden reference (which matches `jax.grad`) to
-> ~1e-7. Driver: `python/mlp_mnist.py` (gate + benchmark + train); C-ABI: `metal_mlp_*` in
-> `src/capi/metal_capi.h`; golden ref: `python/mlp_numpy_ref.py`.
+> `784→H→10` forward + backward + SGD step on-device (MPS matmuls + custom kernels, params never
+> leave the GPU). It **trains MNIST to 98.15% test accuracy** (verified 2026-08-13). Numerically it
+> matches a NumPy golden reference (which matches `jax.grad`) to ~1e-7. Driver:
+> `examples/train_mnist.py` (gate + benchmark + calibrate + train); C-ABI: `metal_mlp_*` in
+> `include/jaxmetal/capi/metal_capi.h`; golden ref: `python/jaxmetal/reference.py`.
+>
+> **Per-step cost was overhead-dominated, and is no longer** (fixed 2026-08-13). One command buffer
+> *per step* meant paying a ~140 µs driver round trip plus ~100 µs of CPU encoding on every step —
+> a ~0.5 ms floor that swamped the actual compute. `MLP::train_steps` now encodes up to
+> `chunk_steps` consecutive SGD steps into **one** command buffer. Combined with cached MPS objects,
+> MPS transpose flags (no materialised x^T/h1^T/W2^T), coalesced encoders, and a properly parallel
+> `nn_reduce_sum_axis0`, the per-step time at hidden=128 dropped **~4.4×** (batch 128: 0.619 →
+> 0.137 ms) and the GPU-beats-CPU crossover moved from **batch >2048 to batch ~60**. See §7.
+>
+> **`Mlp(device=...)`** — the GPU does *not* always win, so the Python trainer routes:
+> `"auto"` (default) picks via a measured cost model, `"gpu"`/`"cpu"` force an arm, and `.device`
+> reports the choice. The CPU arm is `jaxmetal.reference` (NumPy on Accelerate BLAS), so it adds no
+> new numerics. Re-fit the model on other hardware with `--calibrate`; override with
+> `JAXMETAL_MLP_DEVICE=gpu|cpu`.
 >
 > The **PJRT plugin** (a real `mps` *device* so `jax.jit(f, backend='metal')` runs natively) and the
 > **StableHLO→kernel compiler** (Stages 2–3 below) remain the forward roadmap — **not yet built**.
@@ -45,7 +58,7 @@ cmake -S . -B build -G Ninja \
 cmake --build build            # -> build/libmetal_capi.dylib, arith_demo, kernel_tests
 
 # Tests
-ctest --test-dir build --output-on-failure   # 33 C++ unit tests (one CTest case per TEST(...))
+ctest --test-dir build --output-on-failure   # 46 C++ unit tests (one CTest case per TEST(...))
 ctest --test-dir build -R MatmulTiled -V      # run a single test by its TEST(Name)
 .venv/bin/python python/test_jaxmetal.py      # jaxmetal vs jnp.matmul, all shapes × backends
 
@@ -53,13 +66,17 @@ ctest --test-dir build -R MatmulTiled -V      # run a single test by its TEST(Na
 ./build/arith_demo                            # Stage 0/1 GPU-vs-CPU smoke demo
 .venv/bin/python examples/03_resident_speed.py  # the GPU-vs-CPU matmul crossover
 
-# Resident-GPU MLP on MNIST (trains to ~98%, faster than JAX-CPU at batch >= 512)
+# Resident-GPU MLP on MNIST (98.15% test acc; beats JAX-CPU from batch ~60 at hidden=128)
 .venv/bin/python examples/train_mnist.py                        # gate + benchmark + full train
 .venv/bin/python examples/train_mnist.py --gate-only            # GPU fwd/bwd vs numpy golden ref
 .venv/bin/python examples/train_mnist.py --bench-only --batch 1024 --hidden 1024   # GPU vs JAX-CPU step
-.venv/bin/python examples/train_mnist.py --batch 512 --hidden 1024 --lr 0.5 --epochs 25  # ~98.1% acc
+.venv/bin/python examples/train_mnist.py --calibrate            # sweep both arms, re-fit device="auto"
+.venv/bin/python examples/train_mnist.py --device cpu           # force an arm (auto|gpu|cpu)
+.venv/bin/python examples/train_mnist.py --batch 512 --hidden 1024 --lr 0.5 --epochs 25  # 98.15% acc
 .venv/bin/python python/jaxmetal/reference.py                  # verify the golden ref vs jax.grad
 .venv/bin/python tests/python/test_mlp_gate.py                 # network-free GPU-vs-ref gate
+.venv/bin/python tests/python/test_mlp_auto.py                 # chunked == per-step; router vs clock
+JAXMETAL_PROFILE=1 .venv/bin/python examples/train_mnist.py --bench-only  # encode vs wait vs GPU us
 ```
 
 > **Layout note (post-restructure):** C++ namespace is `jaxmetal` (was `mtlrt`); public headers
@@ -69,9 +86,25 @@ ctest --test-dir build -R MatmulTiled -V      # run a single test by its TEST(Na
 
 - **MNIST data** auto-downloads (cached under `data/mnist/`, gitignored). The whole `mlp_numpy_ref`
   golden reference matches `jax.grad` to ~1e-8; the GPU MLP matches that reference to ~1e-7.
-- **The GPU beats CPU only at batch ≥ 512** — below that the ~15 small per-step kernel dispatches
-  dominate. This is the same residency/scale lesson as the matmul crossover (§7): the win needs
-  large-enough resident matmuls. Train at batch ≥ 512 to stay on the GPU-favorable side.
+- **The GPU-beats-CPU crossover is ~batch 60 at hidden=128, and lower as hidden grows** (it already
+  wins at batch 32 for hidden=1024). Below it the per-step fixed cost dominates. **This only holds
+  with `train_steps` / a large `chunk_steps`** — with one command buffer per step the crossover is
+  ~2.3× further right, because the ~140 µs driver round trip is then paid on every step. Measured
+  per-step (M4 Pro, `chunk_steps=128`, 2026-08-13):
+
+  | hidden | batch | GPU ms | JAX-CPU ms | speedup |
+  |-------:|------:|-------:|-----------:|--------:|
+  | 128 | 32   | 0.124 | 0.097 | 0.79× |
+  | 128 | 128  | 0.137 | 0.179 | **1.31×** |
+  | 128 | 512  | 0.206 | 0.446 | **2.17×** |
+  | 128 | 2048 | 0.496 | 1.382 | **2.79×** |
+  | 1024 | 32  | 0.200 | 0.319 | **1.60×** |
+  | 1024 | 2048| 2.023 | 6.400 | **3.16×** |
+
+  Same residency/scale lesson as the matmul crossover (§7), but the binding constraint here was
+  *submission overhead*, not FLOPs — which is why `device="auto"` uses a crossover model rather
+  than the matmul router's `kAutoGpuFlopThreshold` (a FLOP threshold cannot express it: identical
+  FLOP counts fall on opposite sides depending on how they split into batch vs hidden).
 
 - **No lint/format config** is checked in — match surrounding style (C++17/ObjC++17, ARC on `.mm`).
 - **Single C++ test:** `ctest -R <Name>` where `<Name>` is the `TEST(<Name>)` macro argument; each
@@ -299,10 +332,24 @@ and resident variants. Frameworks linked: Metal, Foundation, Accelerate, MetalPe
 Current `src/` runtime: `metal/` (context, buffer, kernel_library),
 `runtime/dispatcher` (1-D `dispatch_1d` + threadgroup-grid `dispatch_threadgroups` for tiled kernels),
 `ops/elementwise` (add/sub/mul/div/max/min, neg/abs/exp), `ops/matmul` (tiled shared-memory matmul,
-`C[M,N]=A[M,K]@B[K,N]`), `ops/mps_matmul` (MPS), `ops/nn` (bias_add, relu, relu_grad,
-reduce_sum_axis0, transpose2d, sgd_update, stable softmax_xent, argmax — the MLP op set), and
-`ops/mlp` (the resident `MLP` class: forward + backward + SGD for `in→H→out`, encoded into a single
-command buffer). Kernels in `kernels/*.metal` (`elementwise`, `matmul`, `nn`), each embedded as a
+`C[M,N]=A[M,K]@B[K,N]`), `ops/mps_matmul` (MPS), `ops/nn` (bias_add, **bias_relu** (fused),
+relu, relu_grad, reduce_sum_axis0, transpose2d, sgd_update, stable softmax_xent, argmax — the MLP
+op set), and `ops/mlp` (the resident `MLP` class: forward + backward + SGD for `in→H→out`).
+
+**`ops/mlp` submission rules — the load-bearing part.** (a) MPS `MPSMatrixMultiplication` +
+`MPSMatrix` objects are built **once per (batch, chunk slot)** and cached in `Impl::plans`;
+rebuilding them per step cost ~28 ObjC allocations/step. (b) The three backward contractions use
+MPS's **`transposeLeft`/`transposeRight`** — descriptors stay the *stored* (untransposed) shapes and
+`interiorColumns` is K *after* transposition, so `x^T`/`h1^T`/`W2^T` are never materialised.
+(c) A `Coalescer` holds one compute encoder open across consecutive kernel dispatches and closes it
+only when an MPS matmul needs the buffer (PyTorch MPS's `endKernelCoalescing`); serial dispatch
+means the read-after-write chains inside a group need no explicit barriers. (d) `train_steps(n)`
+encodes n whole steps into one command buffer — **bit-identical** to n `train_step()` calls (gated
+in `tests/python/test_mlp_auto.py`), since Metal hazard-tracks within a command buffer.
+(e) `nn_reduce_sum_axis0` dispatches **one threadgroup per output column** with a tree reduction;
+the one-thread-per-column version ran 10 threads for `db2` (C=10) and scaled linearly in batch.
+
+Kernels in `kernels/*.metal` (`elementwise`, `matmul`, `nn`), each embedded as a
 string via `cmake/EmbedMetal.cmake`. Tests in `tests/cpp/` use a dependency-free framework; each
 `TEST(Name)` auto-registers as its own CTest case (**46 tests** currently, incl. `nn_test` and
 `mlp_test` parity vs double-precision CPU references). Kernels compile with **safe math**
@@ -322,7 +369,8 @@ would **skip** rather than fail: `MetalContext` throws `jaxmetal::MetalUnavailab
 harness reports `[ SKIP ]` and returns `125`, and each CTest case carries `SKIP_RETURN_CODE 125`
 (set in `CMakeLists.txt`). **GPU regressions are only caught locally** (`ctest` on the M4 Pro, where
 all 46 run for real). Treat the local `ctest` run as the authoritative GPU gate and the Python
-parity gates (`reference.py`, `test_frontend.py`, `test_mlp_gate.py`) as the fast correctness check.
+parity gates (`reference.py`, `test_frontend.py`, `test_mlp_gate.py`, `test_mlp_auto.py`) as the
+fast correctness check.
 To get real GPU coverage in an automated pipeline, add a **self-hosted macOS runner with a GPU**.
 
 ## 9. Open decisions to confirm before Stage 0

@@ -9,8 +9,13 @@ Public surface
     import jaxmetal
     jaxmetal.device_name()                       # "Apple M4 Pro"
     jaxmetal.matmul(a, b, device="mps")          # jnp.matmul-style, explicit backend
-    m = jaxmetal.Mlp(784, 1024, 10, max_batch=512)   # resident GPU MLP trainer
-    loss = m.train_step(lr=0.5)
+    m = jaxmetal.Mlp(784, 1024, 10, max_batch=512)   # MLP trainer, backend auto-picked
+    loss = m.train_step(lr=0.5)                      # m.device -> "gpu" | "cpu"
+
+    # Many SGD steps in ONE command buffer — this is what makes the GPU win at
+    # moderate batch sizes (the ~0.14 ms driver round trip is paid once per chunk):
+    m = jaxmetal.Mlp(784, 128, 10, max_batch=512, chunk_steps=128, device="gpu")
+    m.upload_chunk(X, y); loss = m.train_steps(128, 512, lr=0.5)
 
 Submodules
 ----------
@@ -28,16 +33,38 @@ from __future__ import annotations
 import numpy as np
 import jax.numpy as jnp
 
-from . import _capi
-from ._capi import DeviceBuffer, Mlp, device_name, library_path
+from . import _capi, mlp as _mlp
+from ._capi import DeviceBuffer, device_name, library_path
+from .mlp import CpuMlp, prefer_gpu
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
     "matmul", "device_name", "devices", "library_path",
-    "DeviceBuffer", "Mlp",
+    "DeviceBuffer", "Mlp", "CpuMlp", "prefer_gpu", "MLP_DEVICES",
 ]
+
+MLP_DEVICES = _mlp.DEVICES
+
+
+def Mlp(in_dim, hidden, out_dim, max_batch, chunk_steps=1, device="auto", batch=None):
+    """Resident MLP trainer (in_dim -> hidden -> out_dim, ReLU, softmax-xent, SGD).
+
+    device: "auto" (default) picks GPU or CPU from a measured cost model, "gpu"
+    forces the Metal path, "cpu" forces the NumPy/Accelerate reference path. The
+    returned object carries `.device` naming the arm actually chosen.
+
+    The GPU is NOT always faster — it carries a ~0.115 ms per-step floor against the
+    CPU's ~0.02 ms, so it loses below batch ~110 at hidden=128. `batch` tells "auto"
+    which batch size to predict for (defaults to max_batch); `chunk_steps` lets
+    train_steps() amortise the command-buffer round trip and shifts the crossover
+    down. See jaxmetal/mlp.py for the model and the measurements behind it.
+    """
+    m, chosen = _mlp.make_mlp(in_dim, hidden, out_dim, max_batch, chunk_steps,
+                              device, batch)
+    m.device = chosen
+    return m
 
 DEVICES = ("mps", "metal", "cpu", "auto")
 
