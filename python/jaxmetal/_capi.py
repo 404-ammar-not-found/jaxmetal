@@ -96,7 +96,7 @@ lib.metal_matmul_resident.restype = c_int
 lib.metal_mps_matmul_resident.argtypes = [c_void_p, c_void_p, c_void_p, c_int64, c_int64, c_int64]
 lib.metal_mps_matmul_resident.restype = c_int
 
-lib.metal_mlp_create.argtypes = [c_int64, c_int64, c_int64, c_int64]
+lib.metal_mlp_create.argtypes = [c_int64, c_int64, c_int64, c_int64, c_int64]
 lib.metal_mlp_create.restype = c_void_p
 lib.metal_mlp_destroy.argtypes = [c_void_p]
 lib.metal_mlp_destroy.restype = None
@@ -110,6 +110,12 @@ lib.metal_mlp_forward.argtypes = [c_void_p, c_int64, _f32]
 lib.metal_mlp_forward.restype = c_int
 lib.metal_mlp_train_step.argtypes = [c_void_p, c_int64, c_float, POINTER(c_float)]
 lib.metal_mlp_train_step.restype = c_int
+lib.metal_mlp_upload_chunk.argtypes = [c_void_p, _f32, _i32, c_int64, c_int64]
+lib.metal_mlp_upload_chunk.restype = None
+lib.metal_mlp_train_steps.argtypes = [c_void_p, c_int64, c_int64, c_float]
+lib.metal_mlp_train_steps.restype = c_int
+lib.metal_mlp_last_loss.argtypes = [c_void_p]
+lib.metal_mlp_last_loss.restype = c_float
 
 
 # ---- thin wrappers ----
@@ -203,12 +209,15 @@ class DeviceBuffer:
 class Mlp:
     """Resident in_dim->hidden->out_dim MLP over the C-ABI. Weights, activations,
     gradients, and the current minibatch stay GPU-resident across steps."""
-    def __init__(self, in_dim: int, hidden: int, out_dim: int, max_batch: int):
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, max_batch: int,
+                 chunk_steps: int = 1):
         self.in_dim, self.hidden, self.out_dim = in_dim, hidden, out_dim
         self.max_batch = max_batch
+        self.chunk_steps = chunk_steps
         self._cur_batch = 0
         self._h = lib.metal_mlp_create(c_int64(in_dim), c_int64(hidden),
-                                       c_int64(out_dim), c_int64(max_batch))
+                                       c_int64(out_dim), c_int64(max_batch),
+                                       c_int64(chunk_steps))
         if not self._h:
             raise RuntimeError("metal_mlp_create failed")
 
@@ -255,6 +264,36 @@ class Mlp:
         if rc:
             raise RuntimeError(f"metal_mlp_train_step rc={rc}")
         return float(loss.value)
+
+    def upload_chunk(self, X, y):
+        """Upload n_steps consecutive minibatches laid end to end. X is
+        [n_steps*batch, in_dim] f32, y is [n_steps*batch] int32."""
+        X = _c_f32(X)
+        assert X.shape[1] == self.in_dim
+        self._X = X                                  # keep alive
+        self._y = np.ascontiguousarray(y, dtype=np.int32)
+        assert self._y.shape[0] == X.shape[0]
+        return X.shape[0]
+
+    def train_steps(self, n_steps: int, batch: int, lr: float) -> float:
+        """n_steps SGD steps over the uploaded chunk in ONE command buffer (one host
+        sync for the whole chunk). Returns the mean loss over the chunk."""
+        if n_steps > self.chunk_steps or batch > self.max_batch:
+            raise ValueError(f"train_steps({n_steps}, {batch}) exceeds "
+                             f"chunk_steps={self.chunk_steps} / max_batch={self.max_batch}")
+        # The C side memcpys n_steps*batch rows out of this pointer, so a short
+        # upload would read past the end of the host array.
+        if self._X is None or self._X.shape[0] < n_steps * batch:
+            have = 0 if self._X is None else self._X.shape[0]
+            raise ValueError(f"train_steps needs {n_steps * batch} uploaded rows, "
+                             f"upload_chunk provided {have}")
+        lib.metal_mlp_upload_chunk(self._h, _ptr(self._X), _ptr_i32(self._y),
+                                   c_int64(n_steps), c_int64(batch))
+        rc = lib.metal_mlp_train_steps(self._h, c_int64(n_steps), c_int64(batch),
+                                       c_float(lr))
+        if rc:
+            raise RuntimeError(f"metal_mlp_train_steps rc={rc}")
+        return float(lib.metal_mlp_last_loss(self._h))
 
     def __del__(self):
         h = getattr(self, "_h", None)

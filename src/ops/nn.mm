@@ -18,6 +18,10 @@ struct NNAxpy  { float lr; uint32_t n; };
 struct SCEDims { uint32_t B; uint32_t C; };
 }  // namespace
 
+// Threadgroup width of nn_reduce_sum_axis0. Must match RED_TG in kernels/nn.metal:
+// the kernel's threadgroup array and tree reduction are sized to exactly this.
+constexpr int64_t kReduceTG = 256;
+
 void register_nn_kernels(KernelLibrary& lib) {
   lib.add_source("nn", kernels::nn_msl);
 }
@@ -52,7 +56,12 @@ void reduce_sum_axis0_into(KernelLibrary& lib, Dispatcher& disp,
   void* pso = lib.pipeline("nn_reduce_sum_axis0");
   NNDims2 d{static_cast<uint32_t>(M), static_cast<uint32_t>(N)};
   std::vector<MetalBuffer*> bufs = {&a, &out};
-  disp.dispatch_1d(pso, bufs, N, &d, sizeof(d));   // one thread per output column
+  // One threadgroup of exactly kReduceTG threads per output column; the kernel's
+  // threadgroup array and tree reduction are sized to that width.
+  disp.dispatch_threadgroups(pso, bufs,
+                             /*groups_x=*/N, /*groups_y=*/1, /*groups_z=*/1,
+                             /*tg_x=*/kReduceTG, /*tg_y=*/1, /*tg_z=*/1,
+                             &d, sizeof(d));
 }
 
 void transpose2d_into(KernelLibrary& lib, Dispatcher& disp,

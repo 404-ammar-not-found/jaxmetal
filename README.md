@@ -16,11 +16,11 @@ implementation that is itself checked against `jax.grad`.
 
 ## Summary of results
 
-A `784 → 1024 → 10` MLP trains on MNIST entirely on an M4 Pro GPU to **98.1% test accuracy**.
-Its GPU-resident training step is **1.3–2.0× faster than the equivalent `jax.jit` step on the
-CPU** (Accelerate/AMX) at batch sizes of 512 and above. The speedup comes from two design
-decisions: all tensors remain GPU-resident across steps, and the entire step is encoded into a
-single Metal command buffer with one commit and one host synchronisation.
+A `784 → 1024 → 10` MLP trains on MNIST entirely on an M4 Pro GPU to **98.15% test accuracy**.
+Its GPU-resident training step is **1.6–3.2× faster than the equivalent `jax.jit` step on the
+CPU** (Accelerate/AMX). The speedup comes from two design decisions: all tensors remain
+GPU-resident across steps, and many consecutive SGD steps are encoded into a single Metal
+command buffer, so the driver round trip is paid once per chunk rather than once per step.
 
 <table>
 <tr>
@@ -31,8 +31,12 @@ single Metal command buffer with one commit and one host synchronisation.
 
 ## Capabilities
 
-- **End-to-end GPU training.** Resident forward pass, backward pass, and SGD update. Final
-  accuracy matches the CPU reference implementation to within ±0.5%.
+- **End-to-end GPU training.** Resident forward pass, backward pass, and SGD update, with many
+  steps submitted per command buffer. Final accuracy matches the CPU reference implementation
+  to within ±0.5%.
+- **Backend routing.** `jaxmetal.Mlp(device="auto")` picks the GPU or CPU arm from a measured
+  crossover model, because the GPU is not faster at every size. The CPU arm delegates to the
+  NumPy golden reference, so it introduces no second implementation of the numerics.
 - **Verified numerics.** A pure-NumPy golden reference agrees with `jax.grad` to approximately
   1e-8; the GPU implementation agrees with that reference to approximately 1e-7. The check runs
   as a gate before every training run.
@@ -68,6 +72,7 @@ cmake --build build
 # 4. Run the test suites.
 ctest --test-dir build --output-on-failure        # 46 C++ unit tests
 .venv/bin/python tests/python/test_mlp_gate.py    # GPU MLP against the golden reference
+.venv/bin/python tests/python/test_mlp_auto.py    # chunked == per-step; router against the clock
 ```
 
 To install the Python package: `uv pip install --python .venv -e .`, then `import jaxmetal`.
@@ -89,21 +94,31 @@ FINAL test accuracy: 98.12%  best=98.15%   (PASS >= 97%)
 
 ### Training step latency
 
-Measured on an M4 Pro with `hidden=1024`. Reproduce with
-`examples/train_mnist.py --bench-only --batch <B> --hidden 1024`.
+Measured on an M4 Pro. Reproduce with
+`examples/train_mnist.py --bench-only --batch <B> --hidden <H>`, or sweep both backends with
+`examples/train_mnist.py --calibrate`.
 
-| Batch | GPU step | JAX CPU step | Speedup |
-|------:|---------:|-------------:|:-------:|
-| 128   | 1.41 ms  | 0.68 ms      | 0.48×   |
-| 256   | 1.10 ms  | 1.09 ms      | 0.99×   |
-| 512   | 1.23 ms  | 1.90 ms      | 1.55×   |
-| 1024  | 1.77 ms  | 3.22 ms      | 1.82×   |
-| 2048  | 3.09 ms  | 6.20 ms      | 2.00×   |
+| Batch | `hidden=128` GPU | CPU | Speedup | `hidden=1024` GPU | CPU | Speedup |
+|------:|-----------------:|----:|:-------:|------------------:|----:|:-------:|
+| 32    | 0.124 ms | 0.097 ms | 0.79× | 0.200 ms | 0.319 ms | 1.60× |
+| 128   | 0.137 ms | 0.179 ms | 1.31× | 0.274 ms | 0.664 ms | 2.42× |
+| 512   | 0.206 ms | 0.446 ms | 2.17× | 0.605 ms | 1.827 ms | 3.02× |
+| 2048  | 0.496 ms | 1.382 ms | 2.79× | 2.023 ms | 6.400 ms | 3.16× |
 
-The GPU is faster from batch 512 onward. Below that threshold, the roughly 15 small per-step
-kernel dispatches dominate wall-clock time and the multi-threaded CPU path via Accelerate/AMX
-is the better choice. This is the expected consequence of fixed dispatch overhead against
-insufficient arithmetic intensity, and it is reported here rather than omitted.
+The binding constraint was submission overhead, not arithmetic intensity. Profiling a single
+step (`JAXMETAL_PROFILE=1`) decomposes its 0.446 ms into roughly 140 µs of driver round trip,
+100 µs of CPU-side encoding, and 124 µs of GPU execution — a fixed floor that dominated the
+compute and kept the GPU behind the CPU until batch 1000 or so at `hidden=128`. Batching many
+SGD steps into one command buffer, caching the MPS kernel and matrix objects, using the MPS
+transpose flags instead of materialising transposes, coalescing compute encoders, and
+parallelising the bias-gradient reduction together cut per-step time by about 4.4× and moved
+the crossover to roughly batch 60 at `hidden=128`.
+
+Below that crossover the CPU still wins, and that is a hard limit rather than a missing
+optimisation: a Metal command buffer round trip does not go below about 95 µs, while the whole
+CPU step at batch 1 takes about 20 µs. `jaxmetal.Mlp(device="auto")` therefore routes to
+whichever backend a measured cost model favours, reports the choice on `.device`, and can be
+re-fitted on other hardware with `--calibrate` or overridden with `JAXMETAL_MLP_DEVICE`.
 
 ### Matrix multiplication
 
@@ -178,7 +193,7 @@ python/jaxmetal/    Package: __init__ (public API), _capi (ctypes), ffi, data, r
 examples/           train_mnist, backends_and_batching, jit_ffi, ffi_jit, resident_speed, matmul_showcase
 benchmarks/         bench_matmul.py (MPS versus hand-written kernel versus CPU)
 tests/cpp/          46 C++ unit tests, exposed as individual ctest cases
-tests/python/       Front-end tests and the MLP correctness gate
+tests/python/       Front-end tests, the MLP correctness gate, and the router gate
 docs/               ARCHITECTURE.md, PJRT_PLUGIN.md, images/
 ```
 

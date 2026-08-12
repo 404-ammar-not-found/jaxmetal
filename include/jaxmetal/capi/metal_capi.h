@@ -60,9 +60,12 @@ int metal_matmul_auto_f32(const float* A, const float* B, float* C,
 typedef void* metal_mlp_t;
 
 // max_batch sizes the resident activation/scratch buffers once, up front.
+// chunk_steps sizes the input/label buffers to hold that many consecutive
+// minibatches, so metal_mlp_train_steps can encode that many SGD steps into one
+// command buffer (pass 1 for the plain per-step behaviour).
 // Parameters are UNINITIALIZED — call metal_mlp_set_params. Returns NULL on failure.
 metal_mlp_t metal_mlp_create(int64_t in_dim, int64_t hidden, int64_t out_dim,
-                             int64_t max_batch);
+                             int64_t max_batch, int64_t chunk_steps);
 void        metal_mlp_destroy(metal_mlp_t mlp);
 
 // Host <-> resident params. Row-major f32. W1[in_dim*hidden] b1[hidden]
@@ -85,6 +88,20 @@ int metal_mlp_forward(metal_mlp_t mlp, int64_t batch, float* logits_out);
 // theta -= lr*grad, all resident. Writes the mean cross-entropy loss (pre-update)
 // to *out_loss. Returns 0 on success.
 int metal_mlp_train_step(metal_mlp_t mlp, int64_t batch, float lr, float* out_loss);
+
+// Copy n_steps consecutive minibatches (laid end to end) into the resident input
+// buffers. X[n_steps*batch*in_dim] f32, labels[n_steps*batch] i32.
+void metal_mlp_upload_chunk(metal_mlp_t mlp, const float* X, const int32_t* labels,
+                            int64_t n_steps, int64_t batch);
+
+// n_steps SGD steps over the uploaded chunk, encoded into ONE command buffer with a
+// single host sync. This is what makes the GPU beat the CPU at moderate batch sizes:
+// the ~140us driver round trip is paid once per chunk, not once per step. Read the
+// mean loss with metal_mlp_last_loss. Returns 0 on success.
+int metal_mlp_train_steps(metal_mlp_t mlp, int64_t n_steps, int64_t batch, float lr);
+
+// Mean cross-entropy over the most recent train_step/train_steps call (no sync).
+float metal_mlp_last_loss(metal_mlp_t mlp);
 
 #ifdef __cplusplus
 }  // extern "C"

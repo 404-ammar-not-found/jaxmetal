@@ -172,9 +172,9 @@ int metal_matmul_auto_f32(const float* A, const float* B, float* C,
 // --- Resident MLP -------------------------------------------------------------
 
 metal_mlp_t metal_mlp_create(int64_t in_dim, int64_t hidden, int64_t out_dim,
-                             int64_t max_batch) {
+                             int64_t max_batch, int64_t chunk_steps) {
   try {
-    return new jaxmetal::MLP(in_dim, hidden, out_dim, max_batch);
+    return new jaxmetal::MLP(in_dim, hidden, out_dim, max_batch, chunk_steps);
   } catch (...) {
     return nullptr;
   }
@@ -198,6 +198,26 @@ void metal_mlp_upload_batch(metal_mlp_t m, const float* X, const int32_t* labels
                             int64_t batch) {
   if (!m) return;
   static_cast<jaxmetal::MLP*>(m)->upload_batch(X, labels, batch);
+}
+
+void metal_mlp_upload_chunk(metal_mlp_t m, const float* X, const int32_t* labels,
+                            int64_t n_steps, int64_t batch) {
+  if (!m) return;
+  static_cast<jaxmetal::MLP*>(m)->upload_chunk(X, labels, n_steps, batch);
+}
+
+int metal_mlp_train_steps(metal_mlp_t m, int64_t n_steps, int64_t batch, float lr) {
+  if (!m) return 2;
+  try {
+    static_cast<jaxmetal::MLP*>(m)->train_steps(n_steps, batch, lr);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+
+float metal_mlp_last_loss(metal_mlp_t m) {
+  return m ? static_cast<jaxmetal::MLP*>(m)->last_loss() : 0.0f;
 }
 
 int metal_mlp_forward(metal_mlp_t m, int64_t batch, float* logits_out) {

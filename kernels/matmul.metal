@@ -2,11 +2,12 @@
 //
 // Two kernels:
 //   matmul_tiled   — simple 16x16 shared-memory tiling (reference / fallback).
-//   matmul_blocked — classic register-tiled GEMM: 128x128 threadgroup tiles,
-//                    each thread computes an 8x8 micro-tile of C in registers.
-//                    This maximizes ALU utilization (Apple GPUs have no
-//                    dedicated f32 matrix unit, so raw FMA throughput is the
-//                    lever) and is the fast path.
+//   matmul_blocked — classic register-tiled GEMM: 64x64 threadgroup tiles,
+//                    each thread computes a 4x4 micro-tile of C in registers,
+//                    float4-vectorized loads. Apple GPUs have no dedicated f32
+//                    matrix unit (simdgroup_matrix gave no win), so raw FMA
+//                    throughput is the lever — and occupancy dominates: 8x8
+//                    micro-tiles over-spilled registers and ran slower than 4x4.
 //
 // The host launches these as *uniform* threadgroups (see dispatch_threadgroups);
 // out-of-range global indices are guarded here.

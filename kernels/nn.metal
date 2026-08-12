@@ -33,6 +33,22 @@ kernel void nn_relu(device const float* x   [[buffer(0)]],
   out[gid] = max(x[gid], 0.0f);
 }
 
+// ---- bias_relu (fused): pre = a + bias[j]; out = max(pre, 0)  over [M,N].
+// Fuses nn_bias_add + nn_relu for the hidden layer: one dispatch instead of two,
+// and one pass over [M,N] instead of two. `pre` is kept because relu_grad needs the
+// pre-activation on the backward pass; `pre` may alias `a`.
+kernel void nn_bias_relu(device const float* a    [[buffer(0)]],
+                         device const float* bias [[buffer(1)]],
+                         device float*       pre  [[buffer(2)]],
+                         device float*       out  [[buffer(3)]],
+                         constant NNDims2&   d     [[buffer(4)]],
+                         uint gid [[thread_position_in_grid]]) {
+  if (gid >= d.M * d.N) return;
+  float v = a[gid] + bias[gid % d.N];
+  pre[gid] = v;
+  out[gid] = max(v, 0.0f);
+}
+
 // ---- relu_grad: out = (pre > 0) ? g : 0. `pre` is the pre-activation.
 // Subgradient at 0 is 0 (strict >), matching jax.nn.relu.
 kernel void nn_relu_grad(device const float* pre [[buffer(0)]],
@@ -45,15 +61,33 @@ kernel void nn_relu_grad(device const float* pre [[buffer(0)]],
 }
 
 // ---- reduce_sum_axis0: out[j] = sum_i a[i,j]  ([M,N] -> [N]); bias gradients.
-// One thread per output column j; sequential accumulate over the M rows.
+// ONE THREADGROUP PER OUTPUT COLUMN: its threads stride over the M rows, then
+// tree-reduce in threadgroup memory. The obvious one-thread-per-column version is
+// pathological here — db2 has N = 10 classes, so it ran 10 threads (under a third
+// of one SIMD group) each walking the entire batch serially, and its cost grew
+// linearly in batch size.
+//
+// Launch as N threadgroups of exactly RED_TG threads (see reduce_sum_axis0_into).
+constant constexpr uint RED_TG = 256;
+
 kernel void nn_reduce_sum_axis0(device const float* a   [[buffer(0)]],
                                 device float*       out [[buffer(1)]],
                                 constant NNDims2&   d    [[buffer(2)]],
-                                uint gid [[thread_position_in_grid]]) {
-  if (gid >= d.N) return;
+                                uint col [[threadgroup_position_in_grid]],
+                                uint lid [[thread_position_in_threadgroup]]) {
+  threadgroup float part[RED_TG];
+
   float s = 0.0f;
-  for (uint i = 0; i < d.M; ++i) s += a[i * d.N + gid];
-  out[gid] = s;
+  for (uint i = lid; i < d.M; i += RED_TG) s += a[i * d.N + col];
+  part[lid] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Every thread reaches every barrier; only the low half accumulates.
+  for (uint stride = RED_TG / 2; stride > 0; stride >>= 1) {
+    if (lid < stride) part[lid] += part[lid + stride];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (lid == 0) out[col] = part[0];
 }
 
 // ---- transpose2d: out[N,M] = (a[M,N])^T ; forms A^T and B^T for grads.
