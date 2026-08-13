@@ -42,6 +42,7 @@ from ._capi import (DeviceBuffer, device_name, library_path, reduce_sum,
 from . import routing
 from .mlp import CpuMlp, prefer_gpu
 
+# Single source of truth for the version; pyproject.toml reads this attribute.
 __version__ = "0.7.0"
 
 __all__ = [

@@ -4,36 +4,67 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jaxmetal"
-version = "0.7.0"
-description = "Run JAX workloads on the Apple GPU through hand-written Metal kernels (matmul + resident MLP training)."
+dynamic = ["version"]
+description = "Hand-written Metal GPU kernels for Apple Silicon: dense/batched linear algebra, compensated and extended-precision arithmetic, and a resident MLP trainer, with a JAX-facing front end."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = { file = "LICENSE" }
 authors = [{ name = "Ammar" }]
-keywords = ["jax", "metal", "apple-silicon", "gpu", "mps", "compiler", "kernels"]
+keywords = [
+    "jax", "metal", "apple-silicon", "gpu", "mps", "compiler", "kernels",
+    "linear-algebra", "cholesky", "numerical-computing", "float64",
+]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: C++",
+    "Programming Language :: Objective C",
     "Environment :: GPU",
     "Operating System :: MacOS :: MacOS X",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Typing :: Typed",
 ]
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
 # jaxlib arm64 wheels for macOS exist for CPython 3.10-3.12.
 jax = ["jax[cpu]>=0.4"]
-dev = ["jax[cpu]>=0.4", "pytest>=7"]
+# scipy is used only by benchmarks/bench_cholesky.py, to call LAPACK spotrf directly
+# (numpy's cholesky reorders a C-contiguous array and is ~4x slower, which would
+# overstate the GPU by the same factor).
+bench = ["jax[cpu]>=0.4", "scipy>=1.10"]
+dev = ["jax[cpu]>=0.4", "scipy>=1.10", "pytest>=7"]
 
 [project.urls]
-Homepage = "https://github.com/ammar/jaxmetal"
-Documentation = "https://github.com/ammar/jaxmetal/blob/main/docs/ARCHITECTURE.md"
+Homepage = "https://github.com/404-ammar-not-found/jaxmetal"
+Documentation = "https://github.com/404-ammar-not-found/jaxmetal/tree/main/docs"
+Changelog = "https://github.com/404-ammar-not-found/jaxmetal/blob/main/CHANGELOG.md"
+Issues = "https://github.com/404-ammar-not-found/jaxmetal/issues"
 
 # The native extension (libmetal_capi.dylib) is built with CMake/Ninja, not by
 # setuptools — see README "Build". This package is the pure-Python front-end +
 # ctypes binding, which loads that dylib at import time.
 [tool.setuptools]
+# The Python package lives in python/ rather than src/, because src/ is the C++ and
+# Objective-C++ implementation. This is the usual arrangement for a mixed native
+# project and gives the same import isolation a src-layout does: the repo root is not
+# importable, so tests exercise the installed package rather than a stray CWD copy.
 package-dir = { "" = "python" }
+
+[tool.setuptools.dynamic]
+# Single source of truth: python/jaxmetal/__init__.py. setuptools reads it statically.
+version = { attr = "jaxmetal.__version__" }
+
+[tool.setuptools.package-data]
+# PEP 561 marker: the package ships inline type hints.
+jaxmetal = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["python"]
@@ -41,3 +72,6 @@ include = ["jaxmetal*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
+# These tests drive a real GPU and take seconds, not milliseconds. -q keeps the output
+# readable; the per-test prints carry the measurements.
+addopts = "-q"

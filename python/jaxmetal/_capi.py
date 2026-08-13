@@ -27,25 +27,47 @@ __all__ = [
 
 
 def _find_dylib() -> str:
-    override = os.environ.get("METALMM_DYLIB")
-    if override:
-        if not os.path.exists(override):
-            raise FileNotFoundError(f"METALMM_DYLIB={override!r} does not exist")
-        return override
-    here = os.path.abspath(os.path.dirname(__file__))          # python/metalmm
-    repo_root = os.path.dirname(os.path.dirname(here))          # repo root
+    """Locate libmetal_capi.dylib.
+
+    The wheel is pure Python (`py3-none-any`) and does NOT bundle the native library:
+    it is built out of tree with CMake, because it links Metal, MetalPerformanceShaders
+    and Accelerate and only builds on macOS with the Command Line Tools. So this looks,
+    in order, for an explicit override, a copy sitting beside the package (which is
+    where a future binary wheel would put it), and a sibling `build/` from a source
+    checkout.
+    """
+    # JAXMETAL_DYLIB is the current name; METALMM_DYLIB is the pre-rename spelling,
+    # still honoured so existing scripts do not break.
+    for var in ("JAXMETAL_DYLIB", "METALMM_DYLIB"):
+        override = os.environ.get(var)
+        if override:
+            if not os.path.exists(override):
+                raise FileNotFoundError(f"{var}={override!r} does not exist")
+            return override
+
+    here = os.path.abspath(os.path.dirname(__file__))            # .../jaxmetal
+    repo_root = os.path.dirname(os.path.dirname(here))           # source checkout root
     candidates = [
+        os.path.join(here, "libmetal_capi.dylib"),               # bundled beside package
         os.path.join(repo_root, "build", "libmetal_capi.dylib"),
         os.path.join(repo_root, "build", "Release", "libmetal_capi.dylib"),
     ]
     for c in candidates:
         if os.path.exists(c):
             return c
+
+    installed = "site-packages" in here or "dist-packages" in here
+    hint = (
+        "jaxmetal is installed but its native library was not found. The wheel is pure\n"
+        "Python by design; build the library from a checkout of the repository:\n"
+        if installed else
+        "Build the native library first, from the repository root:\n"
+    )
     raise FileNotFoundError(
-        "Could not locate libmetal_capi.dylib. Build it first:\n"
+        "Could not locate libmetal_capi.dylib.\n" + hint +
         "  cmake -S . -B build -G Ninja && cmake --build build\n"
-        f"Searched: {candidates}\n"
-        "Or set METALMM_DYLIB=/abs/path/to/libmetal_capi.dylib")
+        "then point at it with JAXMETAL_DYLIB=/abs/path/to/libmetal_capi.dylib\n"
+        f"Searched: {candidates}")
 
 
 dylib_path = _find_dylib()

@@ -42,3 +42,9 @@ data/
 *.exe
 *.out
 *.app
+
+# Python packaging / test artefacts
+dist/
+*.egg-info/
+.pytest_cache/
+*.whl

@@ -7,7 +7,7 @@ with `jax.jit` through an XLA FFI custom call.
 
 ![platform](https://img.shields.io/badge/platform-macOS%20·%20Apple%20Silicon-black)
 ![stack](https://img.shields.io/badge/C%2B%2B17%20·%20Metal%20·%20MPS%20·%20Python-blue)
-![tests](https://img.shields.io/badge/tests-68%20C%2B%2B%20%2B%20Python%20gate-brightgreen)
+![tests](https://img.shields.io/badge/tests-73%20C%2B%2B%20%2B%20Python%20gate-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Kernels are hand-written; the project does not use MPSGraph or any existing ML framework for
@@ -42,7 +42,7 @@ command buffer, so the driver round trip is paid once per chunk rather than once
   as a gate before every training run.
 - **Hand-written MSL kernel set.** Register-tiled GEMM, axis reductions, transpose, fused
   numerically stable softmax cross-entropy, ReLU and its gradient, and the SGD update. Each is
-  unit-tested against a double-precision CPU implementation across 68 C++ tests.
+  unit-tested against a double-precision CPU implementation across 73 C++ tests.
 - **Scientific-computing kernels.** Blocked Cholesky (parity with direct LAPACK at
   N=4096, 13x faster than Apple's own MPS decomposition), batched solves for thousands
   of tiny systems (2-3x a scalar C loop, 15-24x numpy batched), and double-single
@@ -58,32 +58,71 @@ command buffer, so the driver round trip is paid once per chunk rather than once
 ## Requirements
 
 macOS on Apple Silicon, Xcode Command Line Tools, and Homebrew. Full Xcode is not required, as
-Metal Shading Language is compiled at runtime.
+Metal Shading Language is compiled at runtime. Python 3.10–3.12 (jaxlib publishes macOS arm64
+wheels only for those).
+
+## Installation
+
+The Python package is a front end over a native library that must be built first. The wheel is
+deliberately pure Python (`py3-none-any`) and does **not** bundle `libmetal_capi.dylib`: it links
+Metal, MetalPerformanceShaders and Accelerate, and only builds on macOS.
+
+```bash
+brew install cmake ninja
+uv venv --python 3.12 .venv
+uv pip install --python .venv -e ".[dev]"
+
+cmake -S . -B build -G Ninja \
+  -DJAX_FFI_INCLUDE_DIR=$(.venv/bin/python -c "import jax.ffi; print(jax.ffi.include_dir())")
+cmake --build build
+```
+
+`import jaxmetal` then finds the library automatically from a source checkout. If it lives
+elsewhere, point at it with `JAXMETAL_DYLIB=/abs/path/to/libmetal_capi.dylib`.
+
+### Extras
+
+| Extra | Pulls in | For |
+|---|---|---|
+| `jax` | `jax[cpu]` | `jaxmetal.ffi`, the MLP CPU arm, the golden reference |
+| `bench` | `+ scipy` | `benchmarks/` (LAPACK `spotrf` called directly) |
+| `dev` | `+ pytest` | the test suite |
+
+## Quickstart
+
+```python
+import numpy as np
+import jaxmetal
+
+# Every op with a measured GPU/CPU crossover takes device="auto" | "gpu" | "cpu".
+L = jaxmetal.cholesky(spd_matrix)                    # blocked, one command buffer
+x = jaxmetal.batched_solve(A, rhs, spd=True)         # thousands of tiny systems
+s = jaxmetal.reduce_sum(big_array)                   # compensated: ~1 ulp, no extra cost
+y = jaxmetal.df64_binop(a, b, "mul")                 # ~48-bit, on a GPU with no float64
+
+m = jaxmetal.Mlp(784, 1024, 10, max_batch=512)       # resident trainer
+m.device                                             # -> "gpu" or "cpu"
+```
+
+`JAXMETAL_DEVICE=gpu|cpu` overrides every router. See
+[docs/features/DEVICE_ROUTING.md](docs/features/DEVICE_ROUTING.md).
 
 ## Build and run
 
 ```bash
-# 1. Toolchain and an isolated, jaxlib-compatible interpreter.
-#    The system Python is frequently too new for the pinned jaxlib.
-brew install cmake ninja
-uv venv --python 3.12 .venv
-uv pip install --python .venv numpy "jax[cpu]"
-
-# 2. Build the native runtime, including the XLA FFI handler.
-cmake -S . -B build -G Ninja \
-  -DJAX_FFI_INCLUDE_DIR=$(.venv/bin/python -c "import jax.ffi; print(jax.ffi.include_dir())")
-cmake --build build
-
-# 3. Train the MLP on MNIST: correctness gate, benchmark, then the SGD loop.
+# Train the MLP on MNIST: correctness gate, benchmark, then the SGD loop.
 .venv/bin/python examples/train_mnist.py --batch 512 --hidden 1024 --lr 0.5 --epochs 25
 
-# 4. Run the test suites.
-ctest --test-dir build --output-on-failure        # 68 C++ unit tests
-.venv/bin/python tests/python/test_mlp_gate.py    # GPU MLP against the golden reference
-.venv/bin/python tests/python/test_mlp_auto.py    # chunked == per-step; router against the clock
-```
+# Test suites. The C++ tests are the authoritative GPU gate.
+ctest --test-dir build --output-on-failure        # 73 C++ unit tests
+.venv/bin/python -m pytest                        # 10 Python gates
 
-To install the Python package: `uv pip install --python .venv -e .`, then `import jaxmetal`.
+# Benchmarks, each reproducing the tables below.
+.venv/bin/python benchmarks/bench_cholesky.py
+.venv/bin/python benchmarks/bench_batched_solve.py
+.venv/bin/python benchmarks/bench_reduce.py
+.venv/bin/python benchmarks/bench_df64.py
+```
 
 ## Benchmarks
 
@@ -228,15 +267,25 @@ cost in throughput. Full details are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE
 ## Repository layout
 
 ```
+pyproject.toml      PEP 621 metadata; version single-sourced from jaxmetal.__version__
+python/jaxmetal/    The package: __init__ (public API), _capi (ctypes), routing, mlp,
+                    ffi, data, reference, plugin, py.typed
+kernels/            Hand-written MSL, embedded at build time and compiled at runtime
 include/jaxmetal/   Public C++ headers (metal/, runtime/, ops/, cpu/, capi/)
-src/                Implementations: metal/, runtime/, ops/{matmul,mps_matmul,nn,mlp,...}, capi/, ffi/
-kernels/            Hand-written MSL: elementwise, matmul, nn (embedded, compiled at runtime)
-python/jaxmetal/    Package: __init__ (public API), _capi (ctypes), ffi, data, reference, plugin
-examples/           train_mnist, backends_and_batching, jit_ffi, ffi_jit, resident_speed, matmul_showcase
-benchmarks/         bench_matmul.py (MPS versus hand-written kernel versus CPU)
-tests/cpp/          68 C++ unit tests, exposed as individual ctest cases
-tests/python/       Front-end tests, the MLP correctness gate, and the router gate
-docs/               README.md (index), ARCHITECTURE.md, PJRT_PLUGIN.md, features/, images/
+src/                C++ / Objective-C++ implementation: metal/, runtime/, ops/, capi/, ffi/
+tests/cpp/          73 unit tests, each exposed as an individual ctest case
+tests/python/       10 pytest gates: front end, MLP correctness, chunking, routing
+benchmarks/         One script per feature, reproducing every table in this README
+examples/           train_mnist and the matmul/FFI demos
+docs/               README.md (index), ARCHITECTURE.md, PJRT_PLUGIN.md, features/
+```
+
+The Python package sits in `python/` rather than `src/`, because `src/` is the C++ and
+Objective-C++ implementation — the usual arrangement for a mixed native project. It gives the
+same isolation a src-layout does: the repository root is not importable, so tests exercise the
+installed package rather than a stray copy in the working directory.
+
+```
 ```
 
 ## Roadmap

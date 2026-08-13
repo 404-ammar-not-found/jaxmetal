@@ -1,6 +1,7 @@
 """Verify jaxmetal.matmul matches jnp.matmul across shapes, ranks, and backends.
 
-    python python/test_jaxmetal.py
+    pytest tests/python/test_frontend.py
+    .venv/bin/python tests/python/test_frontend.py    # standalone, prints a summary
 """
 
 import os
@@ -48,6 +49,11 @@ def main() -> int:
     if fails == 0:
         print("SUCCESS: jaxmetal.matmul matches jnp.matmul (all shapes, all backends).")
     return 1 if fails else 0
+
+
+def test_matmul_matches_jnp():
+    """pytest entry point: the same sweep, asserting rather than counting."""
+    assert main() == 0, "jaxmetal.matmul disagreed with jnp.matmul (see output above)"
 
 
 if __name__ == "__main__":
