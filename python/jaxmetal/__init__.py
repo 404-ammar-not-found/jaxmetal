@@ -35,7 +35,8 @@ import jax.numpy as jnp
 
 from . import _capi, mlp as _mlp
 from ._capi import (DeviceBuffer, device_name, library_path, reduce_sum,
-                    reduce_sum_resident, cholesky, cholesky_resident)
+                    reduce_sum_resident, cholesky, cholesky_resident,
+                    batched_solve, batched_solve_cpu)
 from .mlp import CpuMlp, prefer_gpu
 
 __version__ = "0.2.0"
@@ -45,6 +46,7 @@ __all__ = [
     "matmul", "device_name", "devices", "library_path",
     "DeviceBuffer", "Mlp", "CpuMlp", "prefer_gpu", "MLP_DEVICES",
     "reduce_sum", "reduce_sum_resident", "cholesky", "cholesky_resident",
+    "batched_solve", "batched_solve_cpu",
 ]
 
 MLP_DEVICES = _mlp.DEVICES

@@ -18,6 +18,7 @@ __all__ = [
     "matmul", "matmul_mps", "matmul_cpu", "matmul_auto",
     "matmul_resident", "matmul_resident_mps",
     "reduce_sum", "reduce_sum_resident", "cholesky", "cholesky_resident",
+    "batched_solve", "batched_solve_cpu",
     "Mlp",
 ]
 
@@ -107,6 +108,11 @@ lib.metal_cholesky_resident.restype = c_int
 lib.metal_cholesky_f32.argtypes = [_f32, c_int64]
 lib.metal_cholesky_f32.restype = c_int
 
+lib.metal_batched_solve_f32.argtypes = [_f32, _f32, _f32, _f32, c_int64, c_int64]
+lib.metal_batched_solve_f32.restype = c_int
+lib.metal_batched_solve_cpu_f32.argtypes = [_f32, _f32, _f32, c_int64, c_int64]
+lib.metal_batched_solve_cpu_f32.restype = None
+
 lib.metal_mlp_create.argtypes = [c_int64, c_int64, c_int64, c_int64, c_int64]
 lib.metal_mlp_create.restype = c_void_p
 lib.metal_mlp_destroy.argtypes = [c_void_p]
@@ -174,6 +180,39 @@ def matmul_resident_mps(A, B, C, M, K, N):
                                        c_int64(M), c_int64(K), c_int64(N))
     if rc:
         raise RuntimeError(f"metal_mps_matmul_resident rc={rc}")
+
+
+def batched_solve(A, rhs, return_pivmin: bool = False):
+    """Solve `batch` independent tiny systems A[b] @ x[b] = rhs[b] on the GPU.
+
+    A is [batch, n, n] and rhs is [batch, n], n in [2, 8]. Uses LU with partial
+    pivoting, one GPU thread per system. Above n=8 use numpy or MPS -- Apple's
+    batched MPSMatrixDecompositionLU is faster there.
+
+    With return_pivmin=True also returns min|U_kk|/max|U_kk| per system, which is
+    exactly 0 for a singular system or one whose input held NaN/Inf. It flags
+    SINGULARITY, not ill-conditioning.
+    """
+    A = _c_f32(A); rhs = _c_f32(rhs)
+    assert A.ndim == 3 and A.shape[1] == A.shape[2], "A must be [batch, n, n]"
+    batch, n = A.shape[0], A.shape[1]
+    assert rhs.shape == (batch, n), f"rhs must be [batch, n], got {rhs.shape}"
+    x = np.empty((batch, n), np.float32)
+    piv = np.empty(batch, np.float32)
+    rc = lib.metal_batched_solve_f32(_ptr(A), _ptr(rhs), _ptr(x), _ptr(piv),
+                                     c_int64(batch), c_int64(n))
+    if rc:
+        raise RuntimeError(f"metal_batched_solve_f32 rc={rc} (n must be in [2, 8])")
+    return (x, piv) if return_pivmin else x
+
+
+def batched_solve_cpu(A, rhs):
+    """Single-threaded scalar CPU reference for the same problem."""
+    A = _c_f32(A); rhs = _c_f32(rhs)
+    batch, n = A.shape[0], A.shape[1]
+    x = np.empty((batch, n), np.float32)
+    lib.metal_batched_solve_cpu_f32(_ptr(A), _ptr(rhs), _ptr(x), c_int64(batch), c_int64(n))
+    return x
 
 
 def cholesky(a):

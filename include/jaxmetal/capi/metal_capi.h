@@ -78,6 +78,21 @@ int metal_cholesky_resident(metal_buffer_t A, int64_t n);
 // Host-operand convenience wrapper: copies A in, factors, copies L back out.
 int metal_cholesky_f32(float* A, int64_t n);
 
+// --- Batched tiny-system solve -------------------------------------------------
+// Solve `batch` independent A[b] x[b] = rhs[b] with LU + partial pivoting, one GPU
+// thread per system. A[batch,n,n], rhs[batch,n], x[batch,n], pivmin[batch], all f32
+// row-major. n must be in [2,8]: above that Apple's batched MPSMatrixDecompositionLU
+// is faster (2.4x at n=12, 54x at n=32) so hand-writing it would be a pessimisation.
+// pivmin[b] is min|U_kk|/max|U_kk|, or exactly 0 if system b is singular or its input
+// held NaN/Inf -- a singularity flag, NOT a condition estimate. Returns 0 on success.
+int metal_batched_solve_f32(const float* A, const float* rhs, float* x, float* pivmin,
+                            int64_t batch, int64_t n);
+
+// Single-threaded CPU reference, same algorithm. The honest benchmark baseline: a
+// plain scalar loop is 3-26x faster than looping numpy.linalg.solve at these sizes.
+void metal_batched_solve_cpu_f32(const float* A, const float* rhs, float* x,
+                                 int64_t batch, int64_t n);
+
 // --- Resident MLP (in_dim -> hidden -> out_dim, ReLU, softmax cross-entropy) ----
 // All weights, gradients, activations, and the current minibatch stay GPU-resident
 // across calls; the whole SGD step runs on-device in one command buffer. This is

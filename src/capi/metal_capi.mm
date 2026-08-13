@@ -10,6 +10,7 @@
 #include "jaxmetal/ops/mps_matmul.h"
 #include "jaxmetal/ops/reduce.h"
 #include "jaxmetal/ops/cholesky.h"
+#include "jaxmetal/ops/batched_solve.h"
 #include "jaxmetal/runtime/dispatcher.h"
 
 #include <cstring>
@@ -242,6 +243,42 @@ int metal_cholesky_f32(float* A, int64_t n) {
   } catch (...) {
     return -1;
   }
+}
+
+// --- Batched tiny-system solve -------------------------------------------------
+
+namespace {
+KernelLibrary& batched_solve_lib() {
+  static KernelLibrary lib(MetalContext::instance());
+  static int once = (register_batched_solve_kernels(lib), 0);
+  (void)once;
+  return lib;
+}
+}  // namespace
+
+int metal_batched_solve_f32(const float* A, const float* rhs, float* x, float* pivmin,
+                            int64_t batch, int64_t n) {
+  if (!A || !rhs || !x) return 2;
+  try {
+    MetalContext& ctx = MetalContext::instance();
+    Dispatcher disp(ctx);
+    auto dA = ctx.from_host(A, {batch, n, n}, DType::F32);
+    auto dR = ctx.from_host(rhs, {batch, n}, DType::F32);
+    auto dX = ctx.alloc({batch, n}, DType::F32);
+    auto dP = ctx.alloc({batch}, DType::F32);
+    batched_solve_f32(batched_solve_lib(), disp, *dA, *dR, *dX, *dP, batch, n);
+    disp.wait();
+    std::memcpy(x, dX->contents(), sizeof(float) * (size_t)(batch * n));
+    if (pivmin) std::memcpy(pivmin, dP->contents(), sizeof(float) * (size_t)batch);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+
+void metal_batched_solve_cpu_f32(const float* A, const float* rhs, float* x,
+                                 int64_t batch, int64_t n) {
+  batched_solve_cpu_f32(A, rhs, x, batch, n);
 }
 
 // --- Resident MLP -------------------------------------------------------------
