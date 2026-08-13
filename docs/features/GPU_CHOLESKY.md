@@ -82,10 +82,15 @@ those sweeps.
 
 | N | jaxmetal | GF/s | `spotrf` | GF/s | vs spotrf | `np.linalg.cholesky` | vs numpy | residual |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 512 | 4.85 ms | 9 | 0.36 ms | 125 | 0.07× | 1.31 ms | 0.27× | 4.3e-07 |
-| 1024 | 8.42 ms | 43 | 1.92 ms | 187 | 0.23× | 6.17 ms | 0.73× | 5.4e-07 |
-| 2048 | 15.75 ms | 182 | 8.48 ms | 338 | 0.54× | 34.86 ms | 2.21× | 6.8e-07 |
-| 4096 | 44.73 ms | 512 | **51.21 ms** | 447 | **1.14×** | 178.06 ms | 3.98× | 8.0e-07 |
+| 512 | 6.12 ms | 7 | 0.36 ms | 123 | 0.06× | 1.34 ms | 0.22× | 4.3e-07 |
+| 1024 | 8.24 ms | 43 | 1.92 ms | 186 | 0.23× | 6.32 ms | 0.77× | 5.4e-07 |
+| 2048 | 16.79 ms | 171 | 8.88 ms | 322 | 0.53× | 37.40 ms | 2.23× | 6.8e-07 |
+| 4096 | 46.49 ms | 493 | **54.82 ms** | 418 | **1.18×** | 191.79 ms | 4.13× | 8.0e-07 |
+
+Run-to-run variance on this machine is roughly ±15% under sustained benchmarking
+(thermal), so treat 1.1–1.2× as "parity, slightly ahead" rather than a precise figure.
+The A/B comparisons in Refuted below were each taken within a single run, where that
+drift cancels.
 
 **Read the `vs spotrf` column.** It is a bare Accelerate call on a Fortran-ordered
 array with no copy — the true CPU floor. The result is *parity at N=4096 and a loss
@@ -115,7 +120,7 @@ feature was designed on — "only the panel is hand-written, the GEMM carries al
 FLOPs" — and it explains every failed optimisation below. The panel *phases* are the
 factorisation.
 
-## Refuted: three optimisations that measured worse or flat
+## Refuted: four optimisations that measured worse or flat
 
 All three were predicted to be wins. None are, and together they relocate the
 bottleneck.
@@ -155,6 +160,20 @@ to 64 long, and under safe math the compiler may not reassociate it into indepen
 partial sums — so a hand-split four-way accumulator should expose ILP. Measured: TRSM
 29.13 ms → 29.47 ms. **No improvement**, so chain latency is not what binds it either.
 Reverted rather than kept as unearned complexity.
+
+**4. `MPSMatrixSolveTriangular` for the panel solve.** This API was first dismissed on
+a measurement at order=4096, where it is serial in the order and takes 150 ms — but
+the panel solve is order=**64** with m right-hand sides, an entirely different regime,
+so the dismissal was against the wrong shape. A standalone probe at order=64 looked
+strong: ~0.26 ms for m=4096, against a hand kernel costing ~29 ms across all 64 steps.
+Wired in and measured end to end: **62.2 ms against 47.3 ms**, i.e. clearly worse.
+
+The probe misled because its ~0.25 ms is *real GPU work*, not the command-buffer round
+trip it was assumed to include — so it does not amortise inside a single command
+buffer, and 64 invocations cost more than the hand kernel does in total. Note also
+that MPS TRSM's cost is nearly flat in m (0.405 ms at m=512, 0.264 ms at m=4096),
+which is the signature of a fixed overhead rather than useful work. Reverted;
+reproduce with `JAXMETAL_CHOL_MPS_TRSM=1`.
 
 What *did* help, modestly: holding each thread's row in registers instead of
 re-reading `row[p]` from device memory inside the inner loop (46.6 → 44.7 ms overall,

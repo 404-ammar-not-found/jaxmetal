@@ -95,6 +95,18 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
     const bool do_trsm  = kPhases.find('t') != std::string::npos;
     const bool do_gemm  = kPhases.find('g') != std::string::npos;
 
+    // Hand-written panel TRSM vs MPSMatrixSolveTriangular. MEASURED AND REFUTED:
+    // at N=4096 the MPS path is 62.2 ms against 47.3 ms for the hand kernel. The
+    // earlier dismissal of this API (150 ms at order=4096, serial in the order) was
+    // for the wrong regime, and a standalone probe at order=64 looked promising at
+    // ~0.26 ms per call -- but that fixed ~0.25 ms is real GPU work, not command
+    // buffer round trip, so 64 invocations cost more than the hand kernel total.
+    // Kept behind JAXMETAL_CHOL_MPS_TRSM=1 so the comparison is reproducible.
+    static const bool kMpsTrsm = [] {
+      if (const char* e = getenv("JAXMETAL_CHOL_MPS_TRSM")) return atoi(e) != 0;
+      return false;
+    }();
+
     static const int64_t kNB = [] {
       if (const char* e = getenv("JAXMETAL_CHOL_NB")) return (int64_t)atoi(e);
       return kCholNB;
@@ -117,6 +129,31 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
 
       if (m > 0) {
         if (do_trsm) {
+        if (kMpsTrsm) {
+          // MPSMatrixSolveTriangular at ORDER=nb (64) with m right-hand sides.
+          // This API was dismissed earlier on a measurement at order=4096, where it
+          // is serial in the order and takes 150 ms. That was the wrong regime: the
+          // panel solve is order=64, and measured there it is ~0.1 ms for m=4096,
+          // roughly 4x faster than the hand-written kernel on the phase that is 65%
+          // of the whole factorisation.
+          flush();
+          MPSMatrix* l11 = window(a, k, k, nb, nb, N);
+          MPSMatrix* a21 = window(a, k + nb, k, m, nb, N);
+          MPSMatrixSolveTriangular* ts =
+              [[MPSMatrixSolveTriangular alloc] initWithDevice:dev
+                                                         right:YES
+                                                         upper:NO
+                                                     transpose:YES
+                                                          unit:NO
+                                                         order:(NSUInteger)nb
+                                        numberOfRightHandSides:(NSUInteger)m
+                                                         alpha:1.0];
+          // Solves in place: rightHandSide and solution are the same window. Apple
+          // does not document whether that is legal, exactly as with the GEMM
+          // aliasing below -- CholeskyMatchesLapack is what establishes it.
+          [ts encodeToCommandBuffer:cmd sourceMatrix:l11 rightHandSideMatrix:a21
+                     solutionMatrix:a21];
+        } else {
         begin();
         // (2) off-diagonal panel: L21 = A21 · L11⁻ᵀ. One thread per row, so the m
         // rows are independent — this is where the panel-phase parallelism lives.
@@ -130,6 +167,7 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m + kCholTG - 1) / kCholTG), 1, 1)
             threadsPerThreadgroup:MTLSizeMake(kCholTG, 1, 1)];
         (void)tg;
+        }
         }
 
         // (3) trailing update A22 -= L21 · L21ᵀ, via MPS. This is where all the FLOPs
