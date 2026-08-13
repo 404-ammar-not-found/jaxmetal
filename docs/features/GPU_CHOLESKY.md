@@ -82,10 +82,10 @@ those sweeps.
 
 | N | jaxmetal | GF/s | `spotrf` | GF/s | vs spotrf | `np.linalg.cholesky` | vs numpy | residual |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 512 | 3.56 ms | 13 | 0.36 ms | 123 | 0.10× | 1.31 ms | 0.37× | 4.3e-07 |
-| 1024 | 7.36 ms | 49 | 1.90 ms | 189 | 0.26× | 6.22 ms | 0.85× | 5.4e-07 |
-| 2048 | 16.29 ms | 176 | 8.40 ms | 341 | 0.52× | 34.97 ms | 2.15× | 6.8e-07 |
-| 4096 | 46.70 ms | 491 | **50.59 ms** | 453 | **1.08×** | 178.46 ms | 3.82× | 8.0e-07 |
+| 512 | 4.85 ms | 9 | 0.36 ms | 125 | 0.07× | 1.31 ms | 0.27× | 4.3e-07 |
+| 1024 | 8.42 ms | 43 | 1.92 ms | 187 | 0.23× | 6.17 ms | 0.73× | 5.4e-07 |
+| 2048 | 15.75 ms | 182 | 8.48 ms | 338 | 0.54× | 34.86 ms | 2.21× | 6.8e-07 |
+| 4096 | 44.73 ms | 512 | **51.21 ms** | 447 | **1.14×** | 178.06 ms | 3.98× | 8.0e-07 |
 
 **Read the `vs spotrf` column.** It is a bare Accelerate call on a Fortran-ordered
 array with no copy — the true CPU floor. The result is *parity at N=4096 and a loss
@@ -99,10 +99,26 @@ the last is the honest baseline.
 
 Residual is `max|L·Lᵀ − A| / max|A|`, at 4–8e-07 throughout, i.e. a few f32 eps.
 
-## Refuted: two optimisations that measured worse
+## Where the time actually goes
 
-Both were predicted to be substantial wins. Both are wrong, and together they
-relocate where the bottleneck actually is.
+Measured by phase at N=4096 (`JAXMETAL_CHOL_PHASES` selects `p`anel/`t`rsm/`g`emm;
+skipping a phase gives wrong results and exists only for attribution):
+
+| phase | time | share |
+|---|---:|---:|
+| **TRSM** (`chol_trsm_right`) | ~29 ms | **~65%** |
+| panel (`chol_panel`) | ~16 ms | ~35% |
+| trailing MPS GEMM | ~0.25 ms | **~0.5%** |
+
+**The trailing GEMM is essentially free.** That is the opposite of the assumption this
+feature was designed on — "only the panel is hand-written, the GEMM carries all the
+FLOPs" — and it explains every failed optimisation below. The panel *phases* are the
+factorisation.
+
+## Refuted: three optimisations that measured worse or flat
+
+All three were predicted to be wins. None are, and together they relocate the
+bottleneck.
 
 **1. Approximating SYRK with block-column strips.** `A22` is symmetric, so only its
 lower triangle is needed, but MPS has no SYRK and one square GEMM computes both —
@@ -134,9 +150,21 @@ would help. It does not, because `chol_panel` is one threadgroup doing O(NB³) w
 faster than the GEMM saving. The bottleneck is the panel phases, not the update, and
 not the SYRK waste.
 
-The real fix is therefore **a blocked TRSM that expresses the panel solve as GEMMs
-too** — genuine two-level blocking. That is a different algorithm, not a tuning
-constant, which is why it is not in this version.
+**3. Breaking the TRSM's dependent FMA chain.** `s -= r[p] * L11[j][p]` is a chain up
+to 64 long, and under safe math the compiler may not reassociate it into independent
+partial sums — so a hand-split four-way accumulator should expose ILP. Measured: TRSM
+29.13 ms → 29.47 ms. **No improvement**, so chain latency is not what binds it either.
+Reverted rather than kept as unearned complexity.
+
+What *did* help, modestly: holding each thread's row in registers instead of
+re-reading `row[p]` from device memory inside the inner loop (46.6 → 44.7 ms overall,
+TRSM 31.6 → 29.1 ms, ~8% on the phase). At 64 floats per thread `r` is likely
+spilling, which is the next thing to attack.
+
+The real fix is **a blocked TRSM that expresses the panel solve as GEMMs too** —
+genuine two-level blocking, so the 65% phase becomes GEMM work like the 0.5% phase
+already is. That is a different algorithm, not a tuning constant, which is why it is
+not in this version.
 
 ## Limits and things left out
 

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <stdexcept>
 
 namespace jaxmetal {
@@ -83,6 +84,17 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
     auto begin = [&]() { if (!enc) enc = [cmd computeCommandEncoder]; };
     auto flush = [&]() { if (enc) { [enc endEncoding]; enc = nil; } };
 
+    // Phase mask for attribution only: "ptg" = panel/trsm/gemm. Dropping a phase
+    // produces WRONG results; it exists solely to time where the runtime goes, after
+    // two rounds of reasoning about the bottleneck turned out to be wrong.
+    static const std::string kPhases = [] {
+      const char* e = getenv("JAXMETAL_CHOL_PHASES");
+      return std::string(e ? e : "ptg");
+    }();
+    const bool do_panel = kPhases.find('p') != std::string::npos;
+    const bool do_trsm  = kPhases.find('t') != std::string::npos;
+    const bool do_gemm  = kPhases.find('g') != std::string::npos;
+
     static const int64_t kNB = [] {
       if (const char* e = getenv("JAXMETAL_CHOL_NB")) return (int64_t)atoi(e);
       return kCholNB;
@@ -93,6 +105,7 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
       CholDims d{(uint32_t)N, (uint32_t)k, (uint32_t)nb, (uint32_t)m};
 
       // (1) factor the diagonal block, one threadgroup.
+      if (do_panel) {
       begin();
       [enc setComputePipelineState:pso_panel];
       [enc setBuffer:a offset:0 atIndex:0];
@@ -100,8 +113,11 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
       [enc setBuffer:st offset:0 atIndex:2];
       [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(kCholTG, 1, 1)];
+      }
 
       if (m > 0) {
+        if (do_trsm) {
+        begin();
         // (2) off-diagonal panel: L21 = A21 · L11⁻ᵀ. One thread per row, so the m
         // rows are independent — this is where the panel-phase parallelism lives.
         // Deliberately NOT MPSMatrixSolveTriangular: that is serial in its order and
@@ -114,6 +130,7 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m + kCholTG - 1) / kCholTG), 1, 1)
             threadsPerThreadgroup:MTLSizeMake(kCholTG, 1, 1)];
         (void)tg;
+        }
 
         // (3) trailing update A22 -= L21 · L21ᵀ, via MPS. This is where all the FLOPs
         // are. Both operands and the result are disjoint windows of the SAME buffer;

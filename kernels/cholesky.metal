@@ -104,21 +104,64 @@ kernel void chol_panel(device float*       A [[buffer(0)]],
 // One thread per row of A21, so the m rows are fully independent — this is where the
 // panel-phase parallelism lives (m is up to N-NB). L11 is shared by every row, so it
 // is read straight from device memory and served by cache.
+constant constexpr uint CHOL_NB = 64;   // fast-path block width; matches kCholNB
+
 kernel void chol_trsm_right(device float*      A [[buffer(0)]],
                             constant CholDims& d [[buffer(1)]],
-                            uint gid [[thread_position_in_grid]]) {
-    if (gid >= d.m) return;
+                            uint gid [[thread_position_in_grid]],
+                            uint lid [[thread_position_in_threadgroup]]) {
+    threadgroup float L11[CHOL_NB * CHOL_NB];
     const uint nb = d.nb, n = d.n;
-    device const float* L11 = A + (ulong)d.k * n + d.k;
+    device const float* src = A + (ulong)d.k * n + d.k;
+
+    // L11 is read by every one of the m rows, so stage it once per threadgroup.
+    if (nb == CHOL_NB) {
+        for (uint idx = lid; idx < CHOL_NB * CHOL_NB; idx += CHOL_TG) {
+            uint i = idx / CHOL_NB, j = idx % CHOL_NB;
+            L11[idx] = (i >= j) ? src[(ulong)i * n + j] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (gid >= d.m) return;
     device float* row = A + (ulong)(d.k + nb + gid) * n + d.k;
 
-    // Forward substitution along the row. Every thread reads the same L11, so it is
-    // left in device memory and served by cache rather than staged per threadgroup —
-    // which also removes the NB cap that staging would impose.
+    // FAST PATH: hold this thread's row in REGISTERS across the whole substitution.
+    // The obvious version keeps the row in device memory and reads row[p] inside the
+    // inner loop, which makes every one of the nb^2/2 inner iterations a dependent
+    // device load. That version measured 31.6 ms of a 46.6 ms N=4096 factorisation --
+    // 68% of total runtime, against ~0.5% for the trailing GEMM. nb must be a
+    // COMPILE-TIME constant and both loops fully unrolled, or `r[p]` becomes a dynamic
+    // index into a register array and spills straight back to thread-local memory.
+    if (nb == CHOL_NB) {
+        float r[CHOL_NB];
+        #pragma unroll
+        for (uint j = 0; j < CHOL_NB; ++j) r[j] = row[j];
+
+        // Single accumulator. A four-way split was tried to break the dependent FMA
+        // chain (safe math forbids the compiler reassociating it) and measured NO
+        // improvement: 29.13 -> 29.47 ms. The chain is not what binds this loop; at 64
+        // floats per thread `r` is almost certainly spilling, which is what a real fix
+        // has to address. Reverted rather than left in as unearned complexity.
+        #pragma unroll
+        for (uint j = 0; j < CHOL_NB; ++j) {
+            float s = r[j];
+            #pragma unroll
+            for (uint p = 0; p < CHOL_NB; ++p)
+                if (p < j) s -= r[p] * L11[j * CHOL_NB + p];
+            r[j] = s / L11[j * CHOL_NB + j];
+        }
+
+        #pragma unroll
+        for (uint j = 0; j < CHOL_NB; ++j) row[j] = r[j];
+        return;
+    }
+
+    // Ragged final block (nb < CHOL_NB): scalar fallback straight out of device
+    // memory. It runs once per factorisation on at most CHOL_NB-1 columns.
     for (uint j = 0; j < nb; ++j) {
         float s = row[j];
-        for (uint p = 0; p < j; ++p) s -= row[p] * L11[(ulong)j * n + p];
-        row[j] = s / L11[(ulong)j * n + j];
+        for (uint p = 0; p < j; ++p) s -= row[p] * src[(ulong)j * n + p];
+        row[j] = s / src[(ulong)j * n + j];
     }
 }
 
