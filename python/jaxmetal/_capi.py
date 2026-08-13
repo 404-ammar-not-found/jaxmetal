@@ -19,6 +19,7 @@ __all__ = [
     "matmul_resident", "matmul_resident_mps",
     "reduce_sum", "reduce_sum_resident", "cholesky", "cholesky_resident",
     "batched_solve", "batched_solve_cpu",
+    "df64_binop", "df64_stencil3", "to_df64", "from_df64",
     "Mlp",
 ]
 
@@ -113,6 +114,11 @@ lib.metal_batched_solve_f32.restype = c_int
 lib.metal_batched_solve_cpu_f32.argtypes = [_f32, _f32, _f32, c_int64, c_int64]
 lib.metal_batched_solve_cpu_f32.restype = None
 
+lib.metal_df64_binop.argtypes = [_f32, _f32, _f32, c_int64, c_int]
+lib.metal_df64_binop.restype = c_int
+lib.metal_df64_stencil3.argtypes = [_f32, _f32, _f32, c_int64, c_int]
+lib.metal_df64_stencil3.restype = c_int
+
 lib.metal_mlp_create.argtypes = [c_int64, c_int64, c_int64, c_int64, c_int64]
 lib.metal_mlp_create.restype = c_void_p
 lib.metal_mlp_destroy.argtypes = [c_void_p]
@@ -180,6 +186,67 @@ def matmul_resident_mps(A, B, C, M, K, N):
                                        c_int64(M), c_int64(K), c_int64(N))
     if rc:
         raise RuntimeError(f"metal_mps_matmul_resident rc={rc}")
+
+
+def to_df64(x):
+    """float64 array -> df64 limbs, shape (..., 2) float32. Exact: `lo` holds the
+    part of x that did not fit in `hi`, and is itself representable in f32."""
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    hi = x.astype(np.float32)
+    lo = (x - hi.astype(np.float64)).astype(np.float32)
+    return np.ascontiguousarray(np.stack([hi, lo], axis=-1))
+
+
+def from_df64(v):
+    """df64 limbs -> float64 array."""
+    v = np.asarray(v, dtype=np.float32)
+    return v[..., 0].astype(np.float64) + v[..., 1].astype(np.float64)
+
+
+_DF64_OPS = {"add": 0, "mul": 1, "div": 2}
+
+
+def df64_binop(a, b, op: str = "add"):
+    """Elementwise df64 arithmetic on float64 inputs; returns float64.
+
+    ~48 bits of significand, against f32's 24 and f64's 53. This is a PRECISION
+    feature: it is slower than doing the same work in float64 on the CPU. It exists
+    because Metal has no `double` type at all, so a GPU-resident pipeline otherwise
+    has no way to exceed f32 without round-tripping to the host.
+    """
+    if op not in _DF64_OPS:
+        raise ValueError(f"unknown op {op!r}; expected one of {sorted(_DF64_OPS)}")
+    av, bv = to_df64(a), to_df64(b)
+    n = av.size // 2
+    out = np.empty_like(av)
+    rc = lib.metal_df64_binop(_ptr(av), _ptr(bv), _ptr(out), c_int64(n),
+                              c_int(_DF64_OPS[op]))
+    if rc:
+        raise RuntimeError(f"metal_df64_binop rc={rc}")
+    return from_df64(out)
+
+
+def df64_stencil3(x, coef=(1.0, -2.0, 1.0), use_df64: bool = True):
+    """3-point stencil out[i] = c0*x[i-1] + c1*x[i] + c2*x[i+1], zero boundaries."""
+    n = int(np.asarray(x).size)
+    cd = np.asarray(coef, dtype=np.float64)
+    if use_df64:
+        # df64 kernel reads 3 (hi, lo) pairs; f32 kernel reads 3 plain floats. Passing
+        # the df64 layout to the f32 kernel would silently feed it [hi0, lo0, hi1] --
+        # i.e. the wrong coefficients -- and the comparison would flatter df64 by
+        # orders of magnitude. Keep the two layouts strictly separate.
+        cv = to_df64(cd)
+        xv = to_df64(x)
+        out = np.empty_like(xv)
+    else:
+        cv = np.ascontiguousarray(cd, dtype=np.float32)
+        xv = np.ascontiguousarray(x, dtype=np.float32)
+        out = np.empty_like(xv)
+    rc = lib.metal_df64_stencil3(_ptr(xv), _ptr(out), _ptr(cv), c_int64(n),
+                                 c_int(1 if use_df64 else 0))
+    if rc:
+        raise RuntimeError(f"metal_df64_stencil3 rc={rc}")
+    return from_df64(out) if use_df64 else out.astype(np.float64)
 
 
 def batched_solve(A, rhs, return_pivmin: bool = False):

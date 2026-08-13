@@ -11,6 +11,7 @@
 #include "jaxmetal/ops/reduce.h"
 #include "jaxmetal/ops/cholesky.h"
 #include "jaxmetal/ops/batched_solve.h"
+#include "jaxmetal/ops/df64.h"
 #include "jaxmetal/runtime/dispatcher.h"
 
 #include <cstring>
@@ -279,6 +280,54 @@ int metal_batched_solve_f32(const float* A, const float* rhs, float* x, float* p
 void metal_batched_solve_cpu_f32(const float* A, const float* rhs, float* x,
                                  int64_t batch, int64_t n) {
   batched_solve_cpu_f32(A, rhs, x, batch, n);
+}
+
+// --- Double-single (df64) extended precision -----------------------------------
+
+namespace {
+KernelLibrary& df64_lib() {
+  static KernelLibrary lib(MetalContext::instance());
+  static int once = (register_df64_kernels(lib), 0);
+  (void)once;
+  return lib;
+}
+}  // namespace
+
+int metal_df64_binop(const float* a, const float* b, float* out, int64_t n, int op) {
+  if (!a || !b || !out) return 2;
+  try {
+    MetalContext& ctx = MetalContext::instance();
+    Dispatcher disp(ctx);
+    auto da = ctx.from_host(a, {n * 2}, DType::F32);
+    auto db = ctx.from_host(b, {n * 2}, DType::F32);
+    auto dout = ctx.alloc({n * 2}, DType::F32);
+    const DF64Op o = op == 1 ? DF64Op::Mul : (op == 2 ? DF64Op::Div : DF64Op::Add);
+    df64_elementwise(df64_lib(), disp, o, *da, *db, *dout, n);
+    disp.wait();
+    std::memcpy(out, dout->contents(), sizeof(float) * (size_t)(n * 2));
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+
+int metal_df64_stencil3(const float* x, float* out, const float* coef, int64_t n,
+                        int use_df64) {
+  if (!x || !out || !coef) return 2;
+  try {
+    MetalContext& ctx = MetalContext::instance();
+    Dispatcher disp(ctx);
+    const int64_t w = use_df64 ? 2 : 1;
+    auto dx = ctx.from_host(x, {n * w}, DType::F32);
+    auto dc = ctx.from_host(coef, {use_df64 ? 6 : 3}, DType::F32);
+    auto dout = ctx.alloc({n * w}, DType::F32);
+    df64_stencil3(df64_lib(), disp, *dx, *dout, *dc, n, use_df64 != 0);
+    disp.wait();
+    std::memcpy(out, dout->contents(), sizeof(float) * (size_t)(n * w));
+    return 0;
+  } catch (...) {
+    return 1;
+  }
 }
 
 // --- Resident MLP -------------------------------------------------------------

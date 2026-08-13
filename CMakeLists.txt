@@ -34,6 +34,9 @@ embed_metal(${CMAKE_SOURCE_DIR}/kernels/cholesky.metal
 embed_metal(${CMAKE_SOURCE_DIR}/kernels/batched_solve.metal
             ${GEN_DIR}/kernels_batched_solve.h
             batched_solve_msl)
+embed_metal(${CMAKE_SOURCE_DIR}/kernels/df64.metal
+            ${GEN_DIR}/kernels_df64.h
+            df64_msl)
 embed_metal(${CMAKE_SOURCE_DIR}/kernels/nn.metal
             ${GEN_DIR}/kernels_nn.h
             nn_msl)
@@ -57,6 +60,7 @@ add_library(metal_rt STATIC
   src/ops/reduce.mm
   src/ops/cholesky.mm
   src/ops/batched_solve.mm
+  src/ops/df64.mm
   src/ops/nn.mm
   src/ops/mlp.mm
   src/cpu/cpu_matmul.cpp
@@ -102,6 +106,7 @@ set(TEST_SRCS
   tests/cpp/reduce_test.cpp
   tests/cpp/cholesky_test.cpp
   tests/cpp/batched_solve_test.cpp
+  tests/cpp/df64_test.cpp
   tests/cpp/nn_test.cpp
   tests/cpp/mlp_test.cpp
 )

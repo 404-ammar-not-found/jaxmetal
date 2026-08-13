@@ -93,6 +93,19 @@ int metal_batched_solve_f32(const float* A, const float* rhs, float* x, float* p
 void metal_batched_solve_cpu_f32(const float* A, const float* rhs, float* x,
                                  int64_t batch, int64_t n);
 
+// --- Double-single (df64) extended precision -----------------------------------
+// ~48 bits of significand on a GPU with no f64 at all. A PRECISION feature, not a
+// performance one: slower than the same work in f64 on the CPU at every size, because
+// unified memory gives the GPU no bandwidth advantage to pay for the emulation.
+// Buffers hold interleaved (hi, lo) f32 pairs, i.e. 2*n floats. op: 0=add 1=mul 2=div.
+int metal_df64_binop(const float* a, const float* b, float* out, int64_t n, int op);
+
+// out[i] = c[0]*x[i-1] + c[1]*x[i] + c[2]*x[i+1], zero boundaries. `coef` holds 3
+// df64 values (6 floats). use_df64=0 runs the plain-f32 kernel, in which case x/out
+// hold n floats rather than 2*n.
+int metal_df64_stencil3(const float* x, float* out, const float* coef, int64_t n,
+                        int use_df64);
+
 // --- Resident MLP (in_dim -> hidden -> out_dim, ReLU, softmax cross-entropy) ----
 // All weights, gradients, activations, and the current minibatch stay GPU-resident
 // across calls; the whole SGD step runs on-device in one command buffer. This is
