@@ -1,7 +1,8 @@
-# `device="auto"` routing for the MLP
+# `device="auto"` routing
 
-**Since v0.2.0** · `python/jaxmetal/mlp.py` · `examples/train_mnist.py --calibrate` ·
-`tests/python/test_mlp_auto.py`
+**Since v0.2.0 (MLP), v0.7.0 (scientific ops)** · `python/jaxmetal/mlp.py` ·
+`python/jaxmetal/routing.py` · `tests/python/test_mlp_auto.py` ·
+`tests/python/test_routing.py`
 
 ## The problem
 
@@ -113,6 +114,46 @@ crossover work=6.234e+06 (batch 61 at hidden=128, chunk_steps=128)
   to check the Metal path against the NumPy reference; under `device="auto"` at its
   small batch size it would be handed the reference itself and compare it to itself.
 
+## The scientific ops
+
+`batched_solve`, `cholesky` and `df64_binop` all take `device="auto" | "gpu" | "cpu"`
+too, with thresholds in `python/jaxmetal/routing.py`. `JAXMETAL_DEVICE=gpu|cpu`
+overrides everything.
+
+> **Residency moves the crossover, and it moves it a lot.** These kernels do well under
+> one FLOP per byte moved, so copying host arrays in and out can cost more than the
+> compute. The routers take `resident` explicitly rather than assuming — a host-operand
+> call and a resident call are genuinely different operations with different answers.
+
+| op | CPU arm | host operands | resident |
+|---|---|---|---|
+| `batched_solve` (n=6) | scalar C loop | GPU from ~5,000 systems | GPU from ~2,500 |
+| `df64_binop` | numpy `float64` | **CPU always** — copies are 41× the kernel | GPU from ~4M elements |
+| `cholesky` | `np.linalg.cholesky` | GPU from N≈1300 | — |
+
+The df64 row is the sharpest illustration: the *same kernel* is 1.93× faster than the
+CPU when resident and ~0.04× through the copy path, so a router that ignored residency
+would be wrong by ~50× in one direction or the other.
+
+**The `cholesky` threshold is set against numpy, and numpy is not the fastest CPU
+option.** A direct `spotrf` on a Fortran-ordered array is ~4× quicker (it skips the
+reorder numpy does for a column-major routine), and against *that* the GPU only reaches
+parity at N=4096. The threshold routes against what a Python caller actually invokes;
+if your CPU path is hand-tuned LAPACK, pass `device="cpu"`.
+
+### Gates
+
+`tests/python/test_routing.py` asserts four things, because a cost model that is never
+checked against a clock is a hardcoded guess:
+
+- **Both arms agree numerically** — routing is a performance decision, never a
+  numerical one.
+- **The router picks the faster arm**, timed either side of each crossover, within a
+  35% band (near a crossover the arms are within noise, so being "wrong" costs nothing).
+- **Monotonicity** — a bigger problem never flips the decision back to the CPU.
+- **Residency only lowers thresholds** — copies can only cost time, so the resident
+  crossover must sit at or below the host one.
+
 ## Limits and things left out
 
 - **The model is fitted, not derived.** It interpolates the measured grid; well
@@ -122,4 +163,11 @@ crossover work=6.234e+06 (batch 61 at hidden=128, chunk_steps=128)
   consumer, so a C-side policy would have had no callers.
 - **It routes at construction, on one batch size.** A trainer that varied batch size
   across its lifetime would want per-call routing; nothing needs that yet.
-- **Only the MLP is routed.** `matmul` has its own separate FLOP-threshold router.
+- **`matmul` still has its own separate FLOP-threshold router** and is not covered by
+  `routing.py`.
+- **`reduce_sum` is not routed.** Its argument is accuracy rather than speed —
+  compensated summation is 127× more accurate at no cost — so "which is faster" is the
+  wrong question for it.
+- **Thresholds are constants, not a fitted model** (unlike the MLP's). Each op has one
+  or two measured crossover points rather than a swept grid; that is enough to place a
+  threshold but not to interpolate.

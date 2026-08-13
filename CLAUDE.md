@@ -58,7 +58,7 @@ cmake -S . -B build -G Ninja \
 cmake --build build            # -> build/libmetal_capi.dylib, arith_demo, kernel_tests
 
 # Tests
-ctest --test-dir build --output-on-failure   # 68 C++ unit tests (one CTest case per TEST(...))
+ctest --test-dir build --output-on-failure   # 73 C++ unit tests (one CTest case per TEST(...))
 ctest --test-dir build -R MatmulTiled -V      # run a single test by its TEST(Name)
 .venv/bin/python python/test_jaxmetal.py      # jaxmetal vs jnp.matmul, all shapes × backends
 
@@ -76,6 +76,7 @@ ctest --test-dir build -R MatmulTiled -V      # run a single test by its TEST(Na
 .venv/bin/python python/jaxmetal/reference.py                  # verify the golden ref vs jax.grad
 .venv/bin/python tests/python/test_mlp_gate.py                 # network-free GPU-vs-ref gate
 .venv/bin/python tests/python/test_mlp_auto.py                 # chunked == per-step; router vs clock
+.venv/bin/python tests/python/test_routing.py                  # device=auto for the scientific ops
 .venv/bin/python benchmarks/bench_reduce.py                    # compensated f32 sum: accuracy + GB/s
 JAXMETAL_PROFILE=1 .venv/bin/python examples/train_mnist.py --bench-only  # encode vs wait vs GPU us
 ```
@@ -375,7 +376,7 @@ the one-thread-per-column version ran 10 threads for `db2` (C=10) and scaled lin
 
 Kernels in `kernels/*.metal` (`elementwise`, `matmul`, `nn`), each embedded as a
 string via `cmake/EmbedMetal.cmake`. Tests in `tests/cpp/` use a dependency-free framework; each
-`TEST(Name)` auto-registers as its own CTest case (**68 tests** currently, incl. `nn_test` and
+`TEST(Name)` auto-registers as its own CTest case (**73 tests** currently, incl. `nn_test` and
 `mlp_test` parity vs double-precision CPU references, and `reduce_test` for compensated summation). Kernels compile with **safe math**
 (`MTLMathModeSafe`) so arithmetic is IEEE-correct and matches the JAX CPU reference.
 
@@ -398,7 +399,7 @@ expose **no Metal GPU** (`MTLCreateSystemDefaultDevice()` returns null), so GPU-
 would **skip** rather than fail: `MetalContext` throws `jaxmetal::MetalUnavailable`, the test
 harness reports `[ SKIP ]` and returns `125`, and each CTest case carries `SKIP_RETURN_CODE 125`
 (set in `CMakeLists.txt`). **GPU regressions are only caught locally** (`ctest` on the M4 Pro, where
-all 68 run for real). Treat the local `ctest` run as the authoritative GPU gate and the Python
+all 73 run for real). Treat the local `ctest` run as the authoritative GPU gate and the Python
 parity gates (`reference.py`, `test_frontend.py`, `test_mlp_gate.py`, `test_mlp_auto.py`) as the
 fast correctness check.
 To get real GPU coverage in an automated pipeline, add a **self-hosted macOS runner with a GPU**.

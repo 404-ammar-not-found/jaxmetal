@@ -12,6 +12,8 @@ import os
 from ctypes import c_void_p, c_int, c_int64, c_int32, c_float, POINTER
 import numpy as np
 
+from . import routing as _routing
+
 __all__ = [
     "lib", "dylib_path", "library_path", "device_name",
     "DeviceBuffer",
@@ -211,7 +213,7 @@ def from_df64(v):
 _DF64_OPS = {"add": 0, "mul": 1, "div": 2}
 
 
-def df64_binop(a, b, op: str = "add"):
+def df64_binop(a, b, op: str = "add", device: str = "auto"):
     """Elementwise df64 arithmetic on float64 inputs; returns float64.
 
     ~48 bits of significand, against f32's 24 and f64's 53. This is a PRECISION
@@ -221,6 +223,18 @@ def df64_binop(a, b, op: str = "add"):
     """
     if op not in _DF64_OPS:
         raise ValueError(f"unknown op {op!r}; expected one of {sorted(_DF64_OPS)}")
+
+    # HOST operands. The copies are ~41x the kernel, so this path never beats numpy
+    # float64 on speed at any size -- `auto` routes it to the CPU, and the GPU is
+    # worth asking for only when you specifically want the ~48-bit result computed
+    # on-device. Use df64_binop_resident to get the speed.
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    chosen = _routing.resolve(
+        device, lambda: _routing.prefer_gpu_df64(a.size, resident=False))
+    if chosen == "cpu":
+        return {"add": np.add, "mul": np.multiply, "div": np.divide}[op](a, b)
+
     av, bv = to_df64(a), to_df64(b)
     n = av.size // 2
     out = np.empty_like(av)
@@ -266,7 +280,8 @@ def df64_stencil3(x, coef=(1.0, -2.0, 1.0), use_df64: bool = True):
     return from_df64(out) if use_df64 else out.astype(np.float64)
 
 
-def batched_solve(A, rhs, return_pivmin: bool = False, spd: bool = False):
+def batched_solve(A, rhs, return_pivmin: bool = False, spd: bool = False,
+                  device: str = "auto"):
     """Solve `batch` independent tiny systems A[b] @ x[b] = rhs[b] on the GPU.
 
     A is [batch, n, n] and rhs is [batch, n], n in [2, 8]. Uses LU with partial
@@ -281,6 +296,15 @@ def batched_solve(A, rhs, return_pivmin: bool = False, spd: bool = False):
     assert A.ndim == 3 and A.shape[1] == A.shape[2], "A must be [batch, n, n]"
     batch, n = A.shape[0], A.shape[1]
     assert rhs.shape == (batch, n), f"rhs must be [batch, n], got {rhs.shape}"
+
+    # These are HOST operands, so the crossover is the host one (~5,000 systems):
+    # copying A and rhs in and out costs about as much as solving them.
+    chosen = _routing.resolve(
+        device, lambda: _routing.prefer_gpu_batched_solve(batch, n, resident=False))
+    if chosen == "cpu":
+        x = batched_solve_cpu(A, rhs)
+        return (x, np.ones(batch, np.float32)) if return_pivmin else x
+
     x = np.empty((batch, n), np.float32)
     piv = np.empty(batch, np.float32)
     rc = lib.metal_batched_solve_f32(_ptr(A), _ptr(rhs), _ptr(x), _ptr(piv),
@@ -315,7 +339,7 @@ def batched_solve_cpu(A, rhs):
     return x
 
 
-def cholesky(a):
+def cholesky(a, device: str = "auto"):
     """Blocked GPU Cholesky: returns lower-triangular L with A = L @ L.T.
 
     Raises numpy.linalg.LinAlgError if A is not positive definite (or contains
@@ -323,6 +347,15 @@ def cholesky(a):
     """
     a = _c_f32(a)
     assert a.ndim == 2 and a.shape[0] == a.shape[1], "cholesky needs a square matrix"
+
+    # Routed against np.linalg.cholesky, which is what a Python caller would otherwise
+    # invoke. Note numpy is not the fastest CPU option -- direct spotrf on a
+    # Fortran-ordered array is ~4x quicker -- so pass device="cpu" if your CPU path is
+    # hand-tuned LAPACK. See python/jaxmetal/routing.py.
+    chosen = _routing.resolve(device, lambda: _routing.prefer_gpu_cholesky(a.shape[0]))
+    if chosen == "cpu":
+        return np.linalg.cholesky(a)
+
     out = a.copy()
     info = lib.metal_cholesky_f32(_ptr(out), c_int64(out.shape[0]))
     if info != 0:
