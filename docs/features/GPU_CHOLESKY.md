@@ -129,7 +129,7 @@ factorisation (~0.2 GFLOP/s), so it is pure latency: 64 columns × 64 blocks = 4
 sequential steps, each with a serial diagonal computation and a barrier. That chain is
 Cholesky's inherent data dependency, not an implementation artefact.
 
-## Refuted: eight optimisations that measured worse or flat
+## Refuted: nine optimisations that measured worse or flat
 
 Recorded in full because the aggregate finding is more useful than any of them
 individually: **this factorisation has no single hot spot to attack.** Its three phases
@@ -211,6 +211,32 @@ behind `JAXMETAL_CHOL_TRSM=gemm`.
 **8. Chunking the TRSM row into 16 registers** instead of 64, to raise occupancy.
 Measured: TRSM 29.8 ms → **30.8 ms**. Register pressure is not the limit either.
 
+**9. A recursive (divide-and-conquer) formulation.** The best-motivated attempt of the
+nine, and the only one with direct supporting evidence beforehand. Per-phase GPU time
+against block rank at N=4096:
+
+| NB | 64 | 128 | 256 | 512 |
+|---|---:|---:|---:|---:|
+| GEMM | 43.0 ms | 13.3 ms | 8.9 ms | **7.7 ms** |
+| panel + TRSM | 68.5 ms | 57.6 ms | 109.3 ms | 220.0 ms |
+
+The trailing GEMM improves **5.6×** with rank while the panel degrades, because panel
+work is O(N·NB²). A right-looking loop must pick one NB and accept both curves;
+recursion should not have to — `chol(A11); A21 = A21·A11⁻ᵀ; A22 -= A21·A21ᵀ; chol(A22)`
+keeps a 64-wide base-case panel while its GEMMs are rank n/2.
+
+Implemented (host-side recursion emitting into the same command buffer, so no extra
+synchronisation) and measured: **59.3 ms against 48.8 ms**. Not shipped.
+
+The recursive TRSM is what costs it. Splitting down to a 64-wide base case turns one
+large substitution kernel into ~31 internal GEMMs plus 32 leaf TRSMs *per level*, and
+the per-dispatch overhead of that swarm exceeds what the better GEMM rank returns.
+Meanwhile the base-case panel count is unchanged, so the largest phase does not move at
+all. The 5.6× GEMM figure was real; it just was not reachable at this dispatch cost.
+
+(Implementation note for anyone retrying it: `n1 = ((n/2)/NB)*NB` floors to **0** for
+`NB < n < 2NB`, which is an infinite recursion. It segfaults exactly there.)
+
 What *did* help, modestly: holding each thread's row in registers instead of
 re-reading `row[p]` from device memory inside the inner loop (46.6 → 44.7 ms overall,
 TRSM 31.6 → 29.1 ms, ~8% on the phase). At 64 floats per thread `r` is likely
@@ -225,13 +251,13 @@ not in this version.
 
 - **Below N≈2048 the CPU wins outright**, and below N≈1024 by 4–10×. The fixed
   command-buffer cost plus the sequential panel chain dominate.
-- **Two-level blocking is no longer the obvious next step.** It was proposed on the
-  belief that the TRSM was 65% of runtime; with the corrected attribution the TRSM is
-  22% and the phases are balanced, so restructuring to turn the panel solve into GEMMs
-  addresses the smallest phase. Refutation 7 already tested that idea in miniature and
-  it lost. Any real gain now has to attack the panel's sequential chain — which means a
-  fundamentally different algorithm (a left-looking or recursive formulation), not a
-  restructuring of this one.
+- **There is no known next step that would help.** Nine optimisations have been
+  implemented and measured; one returned 4%. The three phases are balanced, so no
+  single-phase win moves the total much, and the largest phase is a sequential chain
+  intrinsic to Cholesky. Both structural alternatives have now been tried: two-level
+  blocking in miniature (refutation 7) and full recursion (refutation 9), and both lost
+  to per-dispatch overhead. Anything further should start by questioning the
+  one-command-buffer, MPS-GEMM architecture rather than tuning inside it.
 - **LU is not implemented.** Unpivoted LU is not shippable: measured growth factor
   `max|U|/max|A|` is 4.0e3 at N=512 and `inf` on a zero leading pivot. Partial
   pivoting forces a data-dependent host decision per panel, so LU wants a MAGMA-style
