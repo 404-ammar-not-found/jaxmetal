@@ -1,13 +1,9 @@
 """Double-single (df64) extended precision on the GPU: what it buys, and what it costs.
 
-READ THE COST SECTION BEFORE USING THIS. df64 is a PRECISION feature. It is slower
-than doing the same work in float64 on the CPU, at every size. The original rationale
--- that the GPU's higher memory bandwidth would pay for the emulation on
-bandwidth-bound kernels -- was WRONG: Apple Silicon is unified memory, so the CPU and
-GPU share one memory controller and there is no bandwidth advantage to exploit.
-
-It exists because Metal has no `double` type at all, so a pipeline already resident on
-the GPU otherwise has no way to exceed f32 without round-tripping to the host.
+RESIDENCY DECIDES WHETHER THIS IS FAST. Resident, df64 is 1.65-1.88x FASTER than CPU
+float64 above ~4M elements while carrying ~48 bits of significand. Through the
+host-operand path it is ~0.04x, because copying 2*n floats in and out costs 36x the
+kernel. Both are measured below; do not quote one for the other.
 
 Run: .venv/bin/python benchmarks/bench_df64.py
 """
@@ -83,28 +79,37 @@ def accuracy() -> None:
 
 def cost() -> None:
     print("\n=== cost: the same work in float64 on the CPU ===\n")
-    hdr = f"{'n':>10} {'GPU df64':>11} {'CPU f64':>11} {'GPU f32':>11} {'df64 vs CPU':>12}"
+    hdr = (f"{'n':>10} {'df64 resident':>14} {'df64 host':>11} {'CPU f64':>10} "
+           f"{'GPU f32':>10} {'res vs CPU':>11}")
     print(hdr)
     print("-" * len(hdr))
-    for n in (1 << 20, 1 << 22, 1 << 24):
+    from jaxmetal import _capi
+    for n in (1 << 20, 1 << 22, 1 << 24, 1 << 26):
         rng = np.random.default_rng(1)
         a = rng.random(n) + 1.0
         b = rng.random(n) + 1.0
         af, bf = a.astype(np.float32), b.astype(np.float32)
 
+        bA = _capi.DeviceBuffer.from_numpy(jaxmetal.to_df64(a).ravel())
+        bB = _capi.DeviceBuffer.from_numpy(jaxmetal.to_df64(b).ravel())
+        bO = _capi.DeviceBuffer.from_numpy(np.zeros(2 * n, np.float32))
+        t_res = best(lambda: _capi.df64_binop_resident(bA, bB, bO, n, "add"))
         t_df = best(lambda: jaxmetal.df64_binop(a, b, "add"))
         t_cpu = best(lambda: a + b)
         t_f32 = best(lambda: af + bf)
-        print(f"{n:>10,} {t_df*1e3:>9.2f}ms {t_cpu*1e3:>9.2f}ms {t_f32*1e3:>9.2f}ms "
-              f"{t_cpu/t_df:>11.2f}x")
+        print(f"{n:>10,} {t_res*1e3:>12.2f}ms {t_df*1e3:>9.2f}ms {t_cpu*1e3:>8.2f}ms "
+              f"{t_f32*1e3:>8.2f}ms {t_cpu/t_res:>10.2f}x")
+        del bA, bB, bO
 
-    print("\nBelow 1.0x means the CPU wins, and it does. Two reasons, both structural:")
-    print("  * Unified memory: CPU and GPU share one memory controller, so there is no")
-    print("    GPU bandwidth advantage to pay for the ~10-20 ops per df64 operation.")
-    print("  * df64 moves 2x the bytes of f32 for the same element count, and these")
-    print("    kernels are bandwidth-bound.")
-    print("Use df64 when you need the digits on data that is ALREADY resident, not to")
-    print("go faster. If the data is on the host, numpy float64 is the better answer.")
+    print("\nThe crossover is ~4M elements: below it the command-buffer round trip")
+    print("dominates, above it df64 beats CPU float64 outright while carrying ~48 bits.")
+    print("\nCompare the two df64 columns. They run the SAME kernel; the host one just")
+    print("copies 2*n floats in and out, and that is 36x the cost at 16.7M elements.")
+    print("\nNote GPU f32: df64 costs only ~12% more than plain f32 on the GPU despite")
+    print("moving twice the bytes. Larger accesses use the memory system better, so the")
+    print("emulation is close to free once you are bandwidth-bound. Unified memory does")
+    print("mean there is no raw bandwidth RATIO to exploit -- but the GPU still achieves")
+    print("higher streaming bandwidth on this access pattern than the CPU does.")
 
 
 def main() -> None:

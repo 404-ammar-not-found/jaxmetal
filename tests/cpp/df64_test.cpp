@@ -157,6 +157,33 @@ TEST(DF64RoundTripsHostValues) {
   }
 }
 
+// The resident path must be bit-identical to the host path: same kernel, same data,
+// only buffer ownership differs. It is 36x faster at 16.7M elements purely by not
+// copying, so any numerical difference would mean the host wrapper is converting
+// something it should not.
+TEST(DF64ResidentMatchesHostPath) {
+  const int64_t n = 1 << 16;
+  std::vector<double> a((size_t)n), b((size_t)n);
+  std::mt19937 rng(11);
+  std::uniform_real_distribution<double> d(0.5, 2.0);
+  for (int64_t i = 0; i < n; ++i) { a[(size_t)i] = d(rng); b[(size_t)i] = d(rng); }
+
+  auto host = run_ew(DF64Op::Add, a, b);
+
+  MetalContext& ctx = testutil::ctx();
+  Dispatcher disp(ctx);
+  auto av = to_df64(a), bv = to_df64(b);
+  auto da = ctx.from_host(av.data(), {n * 2}, DType::F32);
+  auto db = ctx.from_host(bv.data(), {n * 2}, DType::F32);
+  auto dout = ctx.alloc({n * 2}, DType::F32);
+  df64_elementwise(df_lib(), disp, DF64Op::Add, *da, *db, *dout, n);
+  disp.wait();
+  const float* p = static_cast<const float*>(dout->contents());
+  auto res = from_df64(std::vector<float>(p, p + (size_t)(n * 2)));
+
+  for (size_t i = 0; i < res.size(); ++i) CHECK(res[i] == host[i]);
+}
+
 // The stencil is the representative bandwidth-bound PDE kernel. Coefficients
 // (1, -2, 1) on a smooth field is a second difference, which cancels: with grid step
 // h the result is ~h^2 of the operands, so both precisions lose ~1/h^2 of their

@@ -3,21 +3,27 @@
 **Since v0.6.0** · `kernels/df64.metal` · `src/ops/df64.mm` · `tests/cpp/df64_test.cpp` ·
 `benchmarks/bench_df64.py`
 
-## Read this first: it is slower than the CPU
+## Read this first: residency decides whether it is fast
 
-**df64 is a precision feature, not a performance feature.** It is slower than doing
-the same work in `float64` on the CPU, at every size measured.
+df64 gives ~48 bits of significand on a GPU that has **no `double` type at all**. Its
+speed depends entirely on whether the data is already on the device:
 
-The rationale originally given for building it was that the GPU's higher memory
-bandwidth would pay for the emulation on bandwidth-bound kernels. **That was wrong.**
-Apple Silicon is *unified memory*: the CPU and GPU share one memory controller, so
-there is no GPU bandwidth advantage to exploit for bandwidth-bound work. The error was
-comparing a GPU figure (~273 GB/s) against a discrete-GPU intuition about CPU
-bandwidth (~120 GB/s) that does not apply on this architecture.
+| | vs CPU `float64` |
+|---|---|
+| **Resident** (`df64_binop_resident`) | **1.65–1.88× FASTER** above ~4M elements |
+| Host operands (`df64_binop`) | ~0.04× — the copies dominate completely |
 
-It ships anyway, deliberately, because **Metal has no `double` type at all** — so a
-pipeline whose data is already GPU-resident otherwise has no way to exceed f32 without
-round-tripping to the host.
+**An earlier version of this document said df64 was slower than the CPU at every
+size. That was measured on the host path and was wrong as a statement about the
+feature.** The copies, not the arithmetic, were the cost: at 16.7M elements the host
+path takes 74.8 ms and the resident path 2.07 ms — **36× apart**.
+
+The reasoning that produced the wrong claim is worth keeping. Apple Silicon is unified
+memory, so the CPU and GPU share one memory controller and there is no raw bandwidth
+*ratio* to exploit; that part is true. What it missed is that the GPU still achieves
+higher *streaming* bandwidth on this access pattern, and that the emulation arithmetic
+hides under memory latency almost entirely — df64 costs only **12% more than plain f32
+on the GPU** despite moving twice the bytes.
 
 ## The problem
 
@@ -91,27 +97,36 @@ The test tolerances are derived from this, not tuned to pass.
 | `a * b` | 7.77e-15 | 8.34e-08 | 1.1e7× |
 | 3-pt stencil (1,−2,1), h=0.01 | 1.87e-10 | 3.40e-03 | 1.8e7× |
 
-### And the cost
+### And the cost — resident
 
-| n | GPU df64 | CPU f64 | GPU f32 | df64 vs CPU f64 |
+| n | df64 resident | CPU f64 | GPU f32 resident | df64 vs CPU f64 |
 |---:|---:|---:|---:|---:|
-| 1,048,576 | 5.50 ms | 0.20 ms | 0.10 ms | **0.04×** |
-| 4,194,304 | 21.96 ms | 0.86 ms | 0.35 ms | **0.04×** |
-| 16,777,216 | 89.19 ms | 3.49 ms | 1.58 ms | **0.04×** |
+| 1,048,576 | 0.41 ms | 0.19 ms | 0.10 ms | 0.47× |
+| 4,194,304 | 0.79 ms | 0.78 ms | 0.39 ms | 0.98× |
+| 16,777,216 | 1.88 ms | 3.10 ms | 1.55 ms | **1.65×** |
+| 67,108,864 | 7.01 ms | 13.17 ms | 6.27 ms | **1.88×** |
 
-The GPU column includes the host round trip, which dominates at these sizes — the
-kernel alone is far closer to parity (an independent measurement of a resident 64M
-elementwise add put it at 7.53 ms against 7.08 ms for an 8-thread CPU, i.e. ~0.94×).
-Either way the CPU wins, for two structural reasons: unified memory removes the
-bandwidth advantage, and df64 moves 2× the bytes of f32 for the same element count
-while these kernels are bandwidth-bound.
+**The crossover is ~4M elements.** Below it the command-buffer round trip dominates;
+above it df64 beats CPU `float64` outright while carrying ~48 bits.
+
+Note the `GPU f32` column: df64 costs only **12%** more than plain f32 on the GPU at
+67M, despite moving 2× the bytes. Larger accesses use the memory system better, so the
+emulation is close to free once you are bandwidth-bound.
+
+### The host path, for comparison
+
+| n | df64 host | CPU f64 | ratio |
+|---:|---:|---:|---:|
+| 16,777,216 | 74.82 ms | 3.09 ms | 0.04× |
+
+Same kernel, 36× slower, entirely because of copying 2×n floats in and out.
 
 ## When to use it
 
-- **Yes:** data is already GPU-resident, and a few steps of the pipeline need more
-  than 24 bits — a cancelling difference, a stencil, an accumulation. Staying on
-  device beats round-tripping to the host for f64.
-- **No:** the data is on the host. `numpy` in `float64` is faster *and* more accurate.
+- **Yes:** data is already GPU-resident and there are ≥ ~4M elements. It is both more
+  accurate than f32 and *faster than the CPU in float64*.
+- **No:** the data is on the host and used once. The copies cost 36× the kernel;
+  `numpy` in `float64` is faster and more accurate.
 - **No:** for GEMM. Measured separately: emulated f64 GEMM lands at 270–540 GFLOP/s
   against the CPU's 729 GFLOP/s native `dgemm`. That is why no df64 matmul exists here.
 - **Consider instead:** [COMPENSATED_REDUCTIONS.md](COMPENSATED_REDUCTIONS.md) if the
@@ -123,8 +138,7 @@ while these kernels are bandwidth-bound.
 
 - **No transcendentals** (`exp`, `log`, `sin`). Each needs its own df64 argument
   reduction and polynomial; substantial work, no caller yet.
-- **No resident entry point.** The C ABI copies host arrays in and out, which is what
-  makes the measured cost 0.04× rather than ~0.94×. Since the whole justification is
-  "data already on the GPU", this is the gap most worth closing.
+- **`df64_binop_resident` covers elementwise ops only.** The stencil has no resident
+  entry point yet and still pays the copies.
 - **No df64 matmul**, by design — see above.
 - **f32 exponent range.** Values beyond ~3.4e38 overflow where real f64 would not.
