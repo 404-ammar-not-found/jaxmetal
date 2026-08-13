@@ -17,7 +17,7 @@ __all__ = [
     "DeviceBuffer",
     "matmul", "matmul_mps", "matmul_cpu", "matmul_auto",
     "matmul_resident", "matmul_resident_mps",
-    "reduce_sum", "reduce_sum_resident",
+    "reduce_sum", "reduce_sum_resident", "cholesky", "cholesky_resident",
     "Mlp",
 ]
 
@@ -102,6 +102,11 @@ lib.metal_reduce_sum_f32.restype = c_int
 lib.metal_reduce_sum_resident.argtypes = [c_void_p, c_int64, c_int, POINTER(c_float)]
 lib.metal_reduce_sum_resident.restype = c_int
 
+lib.metal_cholesky_resident.argtypes = [c_void_p, c_int64]
+lib.metal_cholesky_resident.restype = c_int
+lib.metal_cholesky_f32.argtypes = [_f32, c_int64]
+lib.metal_cholesky_f32.restype = c_int
+
 lib.metal_mlp_create.argtypes = [c_int64, c_int64, c_int64, c_int64, c_int64]
 lib.metal_mlp_create.restype = c_void_p
 lib.metal_mlp_destroy.argtypes = [c_void_p]
@@ -169,6 +174,27 @@ def matmul_resident_mps(A, B, C, M, K, N):
                                        c_int64(M), c_int64(K), c_int64(N))
     if rc:
         raise RuntimeError(f"metal_mps_matmul_resident rc={rc}")
+
+
+def cholesky(a):
+    """Blocked GPU Cholesky: returns lower-triangular L with A = L @ L.T.
+
+    Raises numpy.linalg.LinAlgError if A is not positive definite (or contains
+    NaN), matching numpy.linalg.cholesky's contract.
+    """
+    a = _c_f32(a)
+    assert a.ndim == 2 and a.shape[0] == a.shape[1], "cholesky needs a square matrix"
+    out = a.copy()
+    info = lib.metal_cholesky_f32(_ptr(out), c_int64(out.shape[0]))
+    if info != 0:
+        raise np.linalg.LinAlgError(
+            f"matrix is not positive definite (failed at column {info})")
+    return out
+
+
+def cholesky_resident(buf, n: int) -> int:
+    """In-place Cholesky on a resident DeviceBuffer. Returns LAPACK `info`."""
+    return int(lib.metal_cholesky_resident(buf.handle, c_int64(n)))
 
 
 def reduce_sum(x, compensated: bool = True) -> float:

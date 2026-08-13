@@ -9,6 +9,7 @@
 #include "jaxmetal/ops/mlp.h"
 #include "jaxmetal/ops/mps_matmul.h"
 #include "jaxmetal/ops/reduce.h"
+#include "jaxmetal/ops/cholesky.h"
 #include "jaxmetal/runtime/dispatcher.h"
 
 #include <cstring>
@@ -206,6 +207,40 @@ int metal_reduce_sum_resident(metal_buffer_t x, int64_t n, int compensated,
     return 0;
   } catch (...) {
     return 1;
+  }
+}
+
+// --- Blocked Cholesky ----------------------------------------------------------
+
+namespace {
+KernelLibrary& cholesky_lib() {
+  static KernelLibrary lib(MetalContext::instance());
+  static int once = (register_cholesky_kernels(lib), 0);
+  (void)once;
+  return lib;
+}
+}  // namespace
+
+int metal_cholesky_resident(metal_buffer_t A, int64_t n) {
+  if (!A) return -1;
+  try {
+    auto& b = *static_cast<BufferHandle*>(A);
+    return cholesky_f32(MetalContext::instance(), cholesky_lib(), *b, n);
+  } catch (...) {
+    return -1;
+  }
+}
+
+int metal_cholesky_f32(float* A, int64_t n) {
+  if (!A) return -1;
+  try {
+    MetalContext& ctx = MetalContext::instance();
+    auto d = ctx.from_host(A, {n, n}, DType::F32);
+    int info = cholesky_f32(ctx, cholesky_lib(), *d, n);
+    std::memcpy(A, d->contents(), sizeof(float) * (size_t)(n * n));
+    return info;
+  } catch (...) {
+    return -1;
   }
 }
 

@@ -66,6 +66,18 @@ int metal_reduce_sum_f32(const float* x, int64_t n, int compensated, float* out)
 int metal_reduce_sum_resident(metal_buffer_t x, int64_t n, int compensated,
                               float* out);
 
+// --- Blocked Cholesky ----------------------------------------------------------
+// A = L*L^T in place on a resident [N,N] row-major f32 buffer. Lower triangle
+// receives L; the strict upper triangle is zeroed. Returns LAPACK `info`: 0 on
+// success, else the 1-based column at which the matrix stopped being positive
+// definite (this also catches NaN input). The whole factorisation is one command
+// buffer. Apple's own MPSMatrixDecompositionCholesky is NOT used - measured 14x
+// slower than LAPACK on an M4 Pro.
+int metal_cholesky_resident(metal_buffer_t A, int64_t n);
+
+// Host-operand convenience wrapper: copies A in, factors, copies L back out.
+int metal_cholesky_f32(float* A, int64_t n);
+
 // --- Resident MLP (in_dim -> hidden -> out_dim, ReLU, softmax cross-entropy) ----
 // All weights, gradients, activations, and the current minibatch stay GPU-resident
 // across calls; the whole SGD step runs on-device in one command buffer. This is
