@@ -53,6 +53,19 @@ void metal_cpu_matmul_f32(const float* A, const float* B, float* C,
 int metal_matmul_auto_f32(const float* A, const float* B, float* C,
                           int64_t M, int64_t K, int64_t N, int* used_gpu);
 
+// --- Compensated reductions ----------------------------------------------------
+// Sum x[0..n) in f32. `compensated`: 1 = Neumaier compensated summation (accurate
+// to ~1 ulp of the exact sum almost regardless of n), 0 = plain tree sum with
+// identical memory traffic and launch shape (the benchmark baseline). Apple GPUs
+// have no f64, so compensation is the only route to a trustworthy large f32 sum
+// here. Writes the result to *out. Returns 0 on success.
+int metal_reduce_sum_f32(const float* x, int64_t n, int compensated, float* out);
+
+// Same, on an already-resident buffer: no host copy, so timings measure the
+// reduction rather than the transfer.
+int metal_reduce_sum_resident(metal_buffer_t x, int64_t n, int compensated,
+                              float* out);
+
 // --- Resident MLP (in_dim -> hidden -> out_dim, ReLU, softmax cross-entropy) ----
 // All weights, gradients, activations, and the current minibatch stay GPU-resident
 // across calls; the whole SGD step runs on-device in one command buffer. This is

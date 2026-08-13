@@ -25,6 +25,7 @@ trainer** — layered on one small Metal runtime, plus a thin Python front-end.
 │    mlp.mm        resident 784→H→10 MLP: whole train step in ONE cmd buffer │
 │    matmul.mm     register-tiled MSL GEMM      mps_matmul.mm   MPS GEMM      │
 │    nn.mm         bias_add · relu(+grad) · reduce · transpose · softmax-XE   │
+│    reduce.mm     compensated (Neumaier) f32 sum — no f64 on Apple GPUs      │
 │    elementwise.mm                             cpu/cpu_matmul.cpp (BLAS ref) │
 ├────────────────────────────────────────────────────────────────────────── ┤
 │  Runtime       src/metal/ + src/runtime/                                    │
@@ -35,7 +36,7 @@ trainer** — layered on one small Metal runtime, plus a thin Python front-end.
 └───────────────┬──────────────────────────────────────────────────────────┘
                 │ Metal / MPS
 ┌───────────────▼──────────────────────────────────────────────────────────┐
-│  kernels/*.metal   elementwise · matmul · nn   (embedded as strings at     │
+│  kernels/*.metal   elementwise · matmul · nn · reduce  (embedded as strings │
 │                    build time, compiled at runtime with MTLMathModeSafe)   │
 └────────────────────────────────────────────────────────────────────────── ┘
 ```

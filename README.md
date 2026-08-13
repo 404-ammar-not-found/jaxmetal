@@ -7,7 +7,7 @@ with `jax.jit` through an XLA FFI custom call.
 
 ![platform](https://img.shields.io/badge/platform-macOS%20·%20Apple%20Silicon-black)
 ![stack](https://img.shields.io/badge/C%2B%2B17%20·%20Metal%20·%20MPS%20·%20Python-blue)
-![tests](https://img.shields.io/badge/tests-46%20C%2B%2B%20%2B%20Python%20gate-brightgreen)
+![tests](https://img.shields.io/badge/tests-52%20C%2B%2B%20%2B%20Python%20gate-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Kernels are hand-written; the project does not use MPSGraph or any existing ML framework for
@@ -42,7 +42,11 @@ command buffer, so the driver round trip is paid once per chunk rather than once
   as a gate before every training run.
 - **Hand-written MSL kernel set.** Register-tiled GEMM, axis reductions, transpose, fused
   numerically stable softmax cross-entropy, ReLU and its gradient, and the SGD update. Each is
-  unit-tested against a double-precision CPU implementation across 46 C++ tests.
+  unit-tested against a double-precision CPU implementation across 52 C++ tests.
+- **Compensated f32 summation.** Apple GPUs have no `float64` at all, so the usual "promote to
+  double" fix for large-sum error cannot run on-device. Neumaier compensated summation recovers
+  it in f32 — **127× more accurate than a tree sum on adversarial input, at no measurable cost**
+  (both are bandwidth-bound). See [Numerics](#numerics).
 - **JAX integration.** `jaxmetal.ffi.matmul` lowers to an XLA FFI custom call and composes with
   native JAX operations inside `jax.jit`. A PJRT plugin exposing a real `metal` device is
   specified but not yet implemented; see [Roadmap](#roadmap).
@@ -70,7 +74,7 @@ cmake --build build
 .venv/bin/python examples/train_mnist.py --batch 512 --hidden 1024 --lr 0.5 --epochs 25
 
 # 4. Run the test suites.
-ctest --test-dir build --output-on-failure        # 46 C++ unit tests
+ctest --test-dir build --output-on-failure        # 52 C++ unit tests
 .venv/bin/python tests/python/test_mlp_gate.py    # GPU MLP against the golden reference
 .venv/bin/python tests/python/test_mlp_auto.py    # chunked == per-step; router against the clock
 ```
@@ -112,13 +116,47 @@ compute and kept the GPU behind the CPU until batch 1000 or so at `hidden=128`. 
 SGD steps into one command buffer, caching the MPS kernel and matrix objects, using the MPS
 transpose flags instead of materialising transposes, coalescing compute encoders, and
 parallelising the bias-gradient reduction together cut per-step time by about 4.4× and moved
-the crossover to roughly batch 60 at `hidden=128`.
+the crossover to roughly batch 60 at `hidden=128`. Full details in
+[docs/features/CHUNKED_TRAINING.md](docs/features/CHUNKED_TRAINING.md).
 
 Below that crossover the CPU still wins, and that is a hard limit rather than a missing
 optimisation: a Metal command buffer round trip does not go below about 95 µs, while the whole
 CPU step at batch 1 takes about 20 µs. `jaxmetal.Mlp(device="auto")` therefore routes to
 whichever backend a measured cost model favours, reports the choice on `.device`, and can be
-re-fitted on other hardware with `--calibrate` or overridden with `JAXMETAL_MLP_DEVICE`.
+re-fitted on other hardware with `--calibrate` or overridden with `JAXMETAL_MLP_DEVICE`; see
+[docs/features/DEVICE_ROUTING.md](docs/features/DEVICE_ROUTING.md).
+
+### Numerics
+
+Summing a large `float32` array loses precision as the running total outgrows the addends. The
+standard fix is `float64` — which **Apple GPUs do not have** (Metal has no `double` type), so on
+this hardware the choice is normally between an inaccurate GPU sum and moving the data to the CPU.
+
+Neumaier compensated summation tracks the rounding error explicitly and keeps the result accurate
+to ~1 ulp of the exact sum, in f32, on-device. Relative error against a `float64` reference at
+n = 16.7M:
+
+| Input | GPU compensated | GPU tree sum | `numpy` f32 (pairwise) |
+|---|---:|---:|---:|
+| `uniform [-1,1)` | 3.3e-08 | 6.8e-08 | 3.3e-08 |
+| `uniform [0,1)` | 1.6e-08 | 1.6e-08 | 4.3e-08 |
+| **large value + values below its ulp** | **1.0e-08** | 1.3e-06 | 7.0e-08 |
+| `log-uniform 1e-5..1e5` | 3.9e-08 | 7.4e-08 | 3.9e-08 |
+
+f32 machine epsilon is 1.19e-07, so the compensated column is at the limit of what an f32 result
+can express. The comparison is against `numpy`'s *pairwise* sum, not a naive loop.
+
+It is effectively free, because both kernels are memory-bound well below the M4 Pro's ~273 GB/s:
+
+| Elements | Compensated | Tree sum | Overhead |
+|---:|---:|---:|---:|
+| 16.8 M (67 MB) | 171 GB/s | 175 GB/s | 1.02× |
+| 67.1 M (268 MB) | 214 GB/s | 212 GB/s | 0.99× |
+
+Reproduce with `benchmarks/bench_reduce.py`. The kernels require safe math — every compensation
+term is algebraically zero and a fast-math build would fold it away, silently degrading them to a
+plain tree sum; `TEST(ReduceCompensatedBeatsNaive)` guards against that. Full details in
+[docs/features/COMPENSATED_REDUCTIONS.md](docs/features/COMPENSATED_REDUCTIONS.md).
 
 ### Matrix multiplication
 
@@ -192,9 +230,9 @@ kernels/            Hand-written MSL: elementwise, matmul, nn (embedded, compile
 python/jaxmetal/    Package: __init__ (public API), _capi (ctypes), ffi, data, reference, plugin
 examples/           train_mnist, backends_and_batching, jit_ffi, ffi_jit, resident_speed, matmul_showcase
 benchmarks/         bench_matmul.py (MPS versus hand-written kernel versus CPU)
-tests/cpp/          46 C++ unit tests, exposed as individual ctest cases
+tests/cpp/          52 C++ unit tests, exposed as individual ctest cases
 tests/python/       Front-end tests, the MLP correctness gate, and the router gate
-docs/               ARCHITECTURE.md, PJRT_PLUGIN.md, images/
+docs/               README.md (index), ARCHITECTURE.md, PJRT_PLUGIN.md, features/, images/
 ```
 
 ## Roadmap

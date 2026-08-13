@@ -25,6 +25,9 @@ embed_metal(${CMAKE_SOURCE_DIR}/kernels/elementwise.metal
 embed_metal(${CMAKE_SOURCE_DIR}/kernels/matmul.metal
             ${GEN_DIR}/kernels_matmul.h
             matmul_msl)
+embed_metal(${CMAKE_SOURCE_DIR}/kernels/reduce.metal
+            ${GEN_DIR}/kernels_reduce.h
+            reduce_msl)
 embed_metal(${CMAKE_SOURCE_DIR}/kernels/nn.metal
             ${GEN_DIR}/kernels_nn.h
             nn_msl)
@@ -45,6 +48,7 @@ add_library(metal_rt STATIC
   src/ops/elementwise.mm
   src/ops/matmul.mm
   src/ops/mps_matmul.mm
+  src/ops/reduce.mm
   src/ops/nn.mm
   src/ops/mlp.mm
   src/cpu/cpu_matmul.cpp
@@ -87,6 +91,7 @@ set(TEST_SRCS
   tests/cpp/matmul_test.cpp
   tests/cpp/cpu_matmul_test.cpp
   tests/cpp/mps_matmul_test.cpp
+  tests/cpp/reduce_test.cpp
   tests/cpp/nn_test.cpp
   tests/cpp/mlp_test.cpp
 )

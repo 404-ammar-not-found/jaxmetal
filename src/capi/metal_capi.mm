@@ -8,6 +8,7 @@
 #include "jaxmetal/ops/matmul.h"
 #include "jaxmetal/ops/mlp.h"
 #include "jaxmetal/ops/mps_matmul.h"
+#include "jaxmetal/ops/reduce.h"
 #include "jaxmetal/runtime/dispatcher.h"
 
 #include <cstring>
@@ -167,6 +168,45 @@ int metal_matmul_auto_f32(const float* A, const float* B, float* C,
   if (gpu) return metal_mps_matmul_f32(A, B, C, M, K, N);  // MPS: Apple's tuned GPU matmul
   cpu_matmul_f32(A, B, C, M, K, N);
   return 0;
+}
+
+// --- Compensated reductions ----------------------------------------------------
+
+namespace {
+// Reduce kernels compiled once, on first use.
+KernelLibrary& reduce_lib() {
+  static KernelLibrary lib(MetalContext::instance());
+  static int once = (register_reduce_kernels(lib), 0);
+  (void)once;
+  return lib;
+}
+}  // namespace
+
+int metal_reduce_sum_f32(const float* x, int64_t n, int compensated, float* out) {
+  if (!x || !out) return 2;
+  try {
+    MetalContext& ctx = MetalContext::instance();
+    Dispatcher disp(ctx);
+    auto dx = ctx.from_host(x, {n}, DType::F32);
+    *out = reduce_sum_f32(ctx, reduce_lib(), disp, *dx, n, compensated != 0);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+
+int metal_reduce_sum_resident(metal_buffer_t x, int64_t n, int compensated,
+                              float* out) {
+  if (!x || !out) return 2;
+  try {
+    auto& b = *static_cast<BufferHandle*>(x);
+    MetalContext& ctx = MetalContext::instance();
+    Dispatcher disp(ctx);
+    *out = reduce_sum_f32(ctx, reduce_lib(), disp, *b, n, compensated != 0);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
 }
 
 // --- Resident MLP -------------------------------------------------------------

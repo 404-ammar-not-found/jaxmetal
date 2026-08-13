@@ -17,6 +17,7 @@ __all__ = [
     "DeviceBuffer",
     "matmul", "matmul_mps", "matmul_cpu", "matmul_auto",
     "matmul_resident", "matmul_resident_mps",
+    "reduce_sum", "reduce_sum_resident",
     "Mlp",
 ]
 
@@ -96,6 +97,11 @@ lib.metal_matmul_resident.restype = c_int
 lib.metal_mps_matmul_resident.argtypes = [c_void_p, c_void_p, c_void_p, c_int64, c_int64, c_int64]
 lib.metal_mps_matmul_resident.restype = c_int
 
+lib.metal_reduce_sum_f32.argtypes = [_f32, c_int64, c_int, POINTER(c_float)]
+lib.metal_reduce_sum_f32.restype = c_int
+lib.metal_reduce_sum_resident.argtypes = [c_void_p, c_int64, c_int, POINTER(c_float)]
+lib.metal_reduce_sum_resident.restype = c_int
+
 lib.metal_mlp_create.argtypes = [c_int64, c_int64, c_int64, c_int64, c_int64]
 lib.metal_mlp_create.restype = c_void_p
 lib.metal_mlp_destroy.argtypes = [c_void_p]
@@ -163,6 +169,34 @@ def matmul_resident_mps(A, B, C, M, K, N):
                                        c_int64(M), c_int64(K), c_int64(N))
     if rc:
         raise RuntimeError(f"metal_mps_matmul_resident rc={rc}")
+
+
+def reduce_sum(x, compensated: bool = True) -> float:
+    """Sum a 1-D f32 array on the GPU.
+
+    compensated=True uses Neumaier compensated summation, which stays accurate to
+    ~1 ulp of the exact sum almost regardless of length; False uses a plain tree
+    sum with identical memory traffic (the baseline). Apple GPUs have no f64, so
+    compensation is the only way to get a trustworthy large f32 sum here.
+    """
+    x = _c_f32(x).ravel()
+    out = c_float(0.0)
+    rc = lib.metal_reduce_sum_f32(_ptr(x), c_int64(x.size), c_int(1 if compensated else 0),
+                                  ctypes.byref(out))
+    if rc:
+        raise RuntimeError(f"metal_reduce_sum_f32 rc={rc}")
+    return float(out.value)
+
+
+def reduce_sum_resident(buf, n: int, compensated: bool = True) -> float:
+    """Sum an already-resident DeviceBuffer: no host copy, so timings measure the
+    reduction itself rather than the transfer."""
+    out = c_float(0.0)
+    rc = lib.metal_reduce_sum_resident(buf.handle, c_int64(n),
+                                       c_int(1 if compensated else 0), ctypes.byref(out))
+    if rc:
+        raise RuntimeError(f"metal_reduce_sum_resident rc={rc}")
+    return float(out.value)
 
 
 class DeviceBuffer:

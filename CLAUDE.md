@@ -58,7 +58,7 @@ cmake -S . -B build -G Ninja \
 cmake --build build            # -> build/libmetal_capi.dylib, arith_demo, kernel_tests
 
 # Tests
-ctest --test-dir build --output-on-failure   # 46 C++ unit tests (one CTest case per TEST(...))
+ctest --test-dir build --output-on-failure   # 52 C++ unit tests (one CTest case per TEST(...))
 ctest --test-dir build -R MatmulTiled -V      # run a single test by its TEST(Name)
 .venv/bin/python python/test_jaxmetal.py      # jaxmetal vs jnp.matmul, all shapes × backends
 
@@ -76,6 +76,7 @@ ctest --test-dir build -R MatmulTiled -V      # run a single test by its TEST(Na
 .venv/bin/python python/jaxmetal/reference.py                  # verify the golden ref vs jax.grad
 .venv/bin/python tests/python/test_mlp_gate.py                 # network-free GPU-vs-ref gate
 .venv/bin/python tests/python/test_mlp_auto.py                 # chunked == per-step; router vs clock
+.venv/bin/python benchmarks/bench_reduce.py                    # compensated f32 sum: accuracy + GB/s
 JAXMETAL_PROFILE=1 .venv/bin/python examples/train_mnist.py --bench-only  # encode vs wait vs GPU us
 ```
 
@@ -277,7 +278,8 @@ jax-metal-prototype/
 │   └── pjrt/      pjrt_plugin.cc  pjrt_client.cc  pjrt_buffer.cc  pjrt_executable.cc  pjrt_event.cc # Stage 3
 ├── python/jax_metal_plugin/       # __init__.py (register_plugin) + harness/dump_hlo.py
 ├── tests/  cpp/ (ctest kernel tests)  fixtures/*.mlir  python/test_pjrt.py
-└── docs/                          # architecture notes / writeup
+├── docs/                          # README.md index + ARCHITECTURE.md + PJRT_PLUGIN.md
+│   └── features/                  # ONE DOC PER FEATURE — add one whenever a feature lands
 ```
 Build targets: `libmetal_rt` (metal+runtime+compiler, static) → linked into `kernel_test` (Stage 1)
 and `libjax_metal_plugin.dylib` (Stage 3; links `-framework Metal -framework Foundation`; exports only
@@ -334,7 +336,29 @@ Current `src/` runtime: `metal/` (context, buffer, kernel_library),
 `ops/elementwise` (add/sub/mul/div/max/min, neg/abs/exp), `ops/matmul` (tiled shared-memory matmul,
 `C[M,N]=A[M,K]@B[K,N]`), `ops/mps_matmul` (MPS), `ops/nn` (bias_add, **bias_relu** (fused),
 relu, relu_grad, reduce_sum_axis0, transpose2d, sgd_update, stable softmax_xent, argmax — the MLP
-op set), and `ops/mlp` (the resident `MLP` class: forward + backward + SGD for `in→H→out`).
+op set), and `ops/mlp` (the resident `MLP` class: forward + backward + SGD for `in→H→out`), and
+`ops/reduce` (**compensated f32 summation**, below).
+
+**Compensated reductions (`kernels/reduce.metal`, `ops/reduce`) — the scientific-computing
+angle.** Apple GPUs have **no f64 at all** (Metal has no `double`), so the usual "promote to
+float64" fix for large-sum error is unavailable on-device. `reduce_sum_f32(..., compensated=true)`
+uses **Neumaier** summation: a `(sum, compensation)` accumulator that composes associatively via
+`two_sum`, so partial results merge across threads, threadgroups, and the two-pass structure
+without discarding the correction. Measured at n=16.7M: on an adversarial input (a large value in
+every thread's first grid-stride slot, then values below its ulp) the relative error is **1.0e-8 vs
+1.3e-6 for an uncompensated tree sum — 127× better**, and better than numpy's pairwise f32
+(7.0e-8). It is **free**: 214 GB/s vs 212 GB/s for the tree sum at 268 MB, because both are
+bandwidth-bound against ~273 GB/s peak. Benchmark: `benchmarks/bench_reduce.py`.
+
+> **`kernels/reduce.metal` hard-depends on safe math.** Every compensation term has the form
+> `(a - (a + b)) + b`, algebraically zero and legal for a fast-math compiler to fold away. Under
+> fast math these kernels silently degrade to a plain tree sum — same speed, no accuracy, no error.
+> `TEST(ReduceCompensatedBeatsNaive)` is the regression test for exactly that, and it asserts the
+> tree sum *does* lose accuracy so it cannot pass vacuously. Do not enable fast math.
+
+`reduce_sum_axis0_comp` is the accuracy-preserving counterpart of `nn_reduce_sum_axis0`. **The MLP
+still uses the uncompensated one** — its batch reductions are short and the golden-reference gate
+bounds the error already; switching would change MLP numerics for no measured benefit.
 
 **`ops/mlp` submission rules — the load-bearing part.** (a) MPS `MPSMatrixMultiplication` +
 `MPSMatrix` objects are built **once per (batch, chunk slot)** and cached in `Impl::plans`;
@@ -351,9 +375,15 @@ the one-thread-per-column version ran 10 threads for `db2` (C=10) and scaled lin
 
 Kernels in `kernels/*.metal` (`elementwise`, `matmul`, `nn`), each embedded as a
 string via `cmake/EmbedMetal.cmake`. Tests in `tests/cpp/` use a dependency-free framework; each
-`TEST(Name)` auto-registers as its own CTest case (**46 tests** currently, incl. `nn_test` and
-`mlp_test` parity vs double-precision CPU references). Kernels compile with **safe math**
+`TEST(Name)` auto-registers as its own CTest case (**52 tests** currently, incl. `nn_test` and
+`mlp_test` parity vs double-precision CPU references, and `reduce_test` for compensated summation). Kernels compile with **safe math**
 (`MTLMathModeSafe`) so arithmetic is IEEE-correct and matches the JAX CPU reference.
+
+> **Every feature gets a doc.** `docs/features/<FEATURE>.md`, listed in `docs/README.md`, stating
+> the problem it solves as a measurement, how it works, the numbers plus the command that
+> reproduces them, the load-bearing invariants, and the limits. **Record refuted hypotheses there
+> too** — approaches measured as worse are the most expensive knowledge here and the easiest to
+> lose (see the MPS-vs-own-kernel experiment in `features/CHUNKED_TRAINING.md`).
 
 ## 8. Verification strategy (cumulative)
 1. **Kernel unit tests** (Stage 1): each MSL kernel vs a CPU reference, f32 (safe-math ⇒ bit-exact for
@@ -368,7 +398,7 @@ expose **no Metal GPU** (`MTLCreateSystemDefaultDevice()` returns null), so GPU-
 would **skip** rather than fail: `MetalContext` throws `jaxmetal::MetalUnavailable`, the test
 harness reports `[ SKIP ]` and returns `125`, and each CTest case carries `SKIP_RETURN_CODE 125`
 (set in `CMakeLists.txt`). **GPU regressions are only caught locally** (`ctest` on the M4 Pro, where
-all 46 run for real). Treat the local `ctest` run as the authoritative GPU gate and the Python
+all 52 run for real). Treat the local `ctest` run as the authoritative GPU gate and the Python
 parity gates (`reference.py`, `test_frontend.py`, `test_mlp_gate.py`, `test_mlp_auto.py`) as the
 fast correctness check.
 To get real GPU coverage in an automated pipeline, add a **self-hosted macOS runner with a GPU**.
