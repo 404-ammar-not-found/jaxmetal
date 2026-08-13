@@ -88,6 +88,12 @@ int metal_cholesky_f32(float* A, int64_t n);
 int metal_batched_solve_f32(const float* A, const float* rhs, float* x, float* pivmin,
                             int64_t batch, int64_t n);
 
+// Same, on already-resident buffers. These kernels do well under one FLOP per byte
+// moved, so the host copies cost about as much as the solve: use this whenever the
+// data is already on the GPU or is reused across calls. pivmin may be NULL.
+int metal_batched_solve_resident(metal_buffer_t A, metal_buffer_t rhs, metal_buffer_t x,
+                                 metal_buffer_t pivmin, int64_t batch, int64_t n);
+
 // Single-threaded CPU reference, same algorithm. The honest benchmark baseline: a
 // plain scalar loop is 3-26x faster than looping numpy.linalg.solve at these sizes.
 void metal_batched_solve_cpu_f32(const float* A, const float* rhs, float* x,

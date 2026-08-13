@@ -277,6 +277,31 @@ int metal_batched_solve_f32(const float* A, const float* rhs, float* x, float* p
   }
 }
 
+int metal_batched_solve_resident(metal_buffer_t A, metal_buffer_t rhs, metal_buffer_t x,
+                                 metal_buffer_t pivmin, int64_t batch, int64_t n) {
+  if (!A || !rhs || !x) return 2;
+  try {
+    MetalContext& ctx = MetalContext::instance();
+    Dispatcher disp(ctx);
+    auto& dA = *static_cast<BufferHandle*>(A);
+    auto& dR = *static_cast<BufferHandle*>(rhs);
+    auto& dX = *static_cast<BufferHandle*>(x);
+    // pivmin is optional; the kernel always writes it, so give it somewhere to go.
+    static thread_local std::shared_ptr<MetalBuffer> scratch;
+    BufferHandle* dP = static_cast<BufferHandle*>(pivmin);
+    if (!dP) {
+      if (!scratch || scratch->num_elements() < batch)
+        scratch = ctx.alloc({batch}, DType::F32);
+    }
+    batched_solve_f32(batched_solve_lib(), disp, *dA, *dR, *dX,
+                      dP ? **dP : *scratch, batch, n);
+    disp.wait();
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+
 void metal_batched_solve_cpu_f32(const float* A, const float* rhs, float* x,
                                  int64_t batch, int64_t n) {
   batched_solve_cpu_f32(A, rhs, x, batch, n);

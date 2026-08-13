@@ -81,42 +81,47 @@ its answer is wrong in the fourth digit.
 ## Measurements
 
 `.venv/bin/python benchmarks/bench_batched_solve.py` — M4 Pro, batch = 65,536,
-systems/second. The GPU column **includes the host round trip**, which is what a
-caller passing numpy arrays actually pays:
+systems/second. Two GPU columns, because they answer different questions: **host**
+includes the round trip (what `jaxmetal.batched_solve(numpy_array)` costs), **resident**
+runs the same kernel on buffers already on the device.
 
-| n | GPU | scalar C loop | `np.linalg.solve` | vs C | vs numpy | residual |
+| n | GPU host | GPU resident | scalar C loop | `np.linalg.solve` | resident vs C | residual |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2 | 1.61e8 | 1.02e8 | 6.97e6 | 1.6× | 23.1× | 1.3e-07 |
-| 3 | 1.21e8 | 5.31e7 | 4.97e6 | 2.3× | 24.2× | 1.6e-07 |
-| 4 | 8.58e7 | 4.12e7 | 3.71e6 | 2.1× | 23.1× | 1.6e-07 |
-| 6 | 4.78e7 | 1.89e7 | 2.36e6 | 2.5× | 20.3× | 1.7e-07 |
-| 8 | 2.77e7 | 1.01e7 | 1.82e6 | 2.8× | 15.3× | 2.1e-07 |
+| 2 | 1.97e8 | 3.59e8 | 1.11e8 | 7.43e6 | 3.2× | 1.3e-07 |
+| 3 | 1.33e8 | 2.96e8 | 5.64e7 | 5.29e6 | 5.2× | 1.6e-07 |
+| 4 | 8.72e7 | 2.00e8 | 4.38e7 | 3.96e6 | 4.6× | 1.6e-07 |
+| 6 | 4.34e7 | 1.23e8 | 1.94e7 | 2.53e6 | 6.3× | 1.7e-07 |
+| 8 | 2.51e7 | 5.17e7 | 1.05e7 | 1.91e6 | 4.9× | 2.1e-07 |
 
-**Read the `vs C` column.** Looping `numpy.linalg.solve` per system measures numpy's
+**Read against the C loop.** Looping `numpy.linalg.solve` per system measures numpy's
 per-call overhead rather than linear algebra and would have shown two orders of
 magnitude; even numpy's genuinely-batched call is 15–24× off, which is mostly generic
-machinery. A plain scalar C loop is the honest bar, and against it this is **2–3×**.
+machinery. A plain scalar C loop is the honest bar.
+
+**Residency is worth ~2.4×** — these kernels do well under one FLOP per byte moved, so
+the host copies cost about as much as the solve.
 
 ### Crossover (n = 6)
 
-| batch | GPU | C loop | numpy | winner |
-|---:|---:|---:|---:|:--|
-| 1,024 | 0.221 ms | 0.052 ms | 0.421 ms | CPU |
-| 4,096 | 0.331 ms | 0.203 ms | 1.619 ms | CPU |
-| 16,384 | 0.509 ms | 0.886 ms | 6.608 ms | **GPU** |
-| 262,144 | 6.268 ms | 14.104 ms | 111.844 ms | **GPU** |
+| batch | GPU host | GPU resident | C loop | numpy | host wins | resident wins |
+|---:|---:|---:|---:|---:|:--|:--|
+| 1,024 | 0.283 ms | 0.131 ms | 0.053 ms | 0.382 ms | no | no |
+| 4,096 | 0.218 ms | 0.163 ms | 0.205 ms | 1.524 ms | no | **yes** |
+| 16,384 | 0.366 ms | 0.243 ms | 0.807 ms | 6.329 ms | **yes** | **yes** |
+| 262,144 | 5.361 ms | **0.915 ms** | 13.121 ms | 104.513 ms | **yes** | **yes** |
 
-Below ~8,000 systems the command-buffer round trip costs more than the entire solve.
+Residency moves the crossover from ~16,000 systems to ~4,000, and at batch 262,144 it
+is **14.3× the C loop**. Below the crossover the command-buffer round trip costs more
+than the entire solve.
 
 ## Limits and things left out
 
 - **`nrhs` is 1.** Multiple right-hand sides would need tail masking on both load and
   store; getting that wrong writes past the end of the output buffer, which Metal does
   not bounds-check. Not worth the hazard until a caller needs it.
-- **Host operands only.** These kernels do well under one FLOP per byte moved, so
-  residency matters more here than for matmul — the transfer costs about as much as
-  the solve. A resident entry point would move the crossover down sharply and is the
-  obvious next step.
+- **`batched_solve_resident` takes `DeviceBuffer`s directly**; the numpy-facing
+  `batched_solve` copies in and out and is ~2.4× slower. Use the resident path when
+  data is already on the device or reused across calls.
 - **No batched Cholesky.** The SPD case would save roughly half the work; it is a
   mechanical variant of the same kernel.
 - **f32 only.** Apple GPUs have no f64. Forward error tracks `cond · eps_f32`, so

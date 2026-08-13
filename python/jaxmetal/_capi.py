@@ -18,7 +18,7 @@ __all__ = [
     "matmul", "matmul_mps", "matmul_cpu", "matmul_auto",
     "matmul_resident", "matmul_resident_mps",
     "reduce_sum", "reduce_sum_resident", "cholesky", "cholesky_resident",
-    "batched_solve", "batched_solve_cpu",
+    "batched_solve", "batched_solve_cpu", "batched_solve_resident",
     "df64_binop", "df64_stencil3", "to_df64", "from_df64",
     "Mlp",
 ]
@@ -111,6 +111,9 @@ lib.metal_cholesky_f32.restype = c_int
 
 lib.metal_batched_solve_f32.argtypes = [_f32, _f32, _f32, _f32, c_int64, c_int64]
 lib.metal_batched_solve_f32.restype = c_int
+lib.metal_batched_solve_resident.argtypes = [c_void_p, c_void_p, c_void_p, c_void_p,
+                                             c_int64, c_int64]
+lib.metal_batched_solve_resident.restype = c_int
 lib.metal_batched_solve_cpu_f32.argtypes = [_f32, _f32, _f32, c_int64, c_int64]
 lib.metal_batched_solve_cpu_f32.restype = None
 
@@ -271,6 +274,20 @@ def batched_solve(A, rhs, return_pivmin: bool = False):
     if rc:
         raise RuntimeError(f"metal_batched_solve_f32 rc={rc} (n must be in [2, 8])")
     return (x, piv) if return_pivmin else x
+
+
+def batched_solve_resident(bufA, bufR, bufX, batch: int, n: int, bufP=None):
+    """Batched solve on already-resident DeviceBuffers: no host copies.
+
+    These kernels do well under one FLOP per byte moved, so the copies in
+    `batched_solve` cost about as much as the solve. Use this when the data is
+    already on the GPU or is reused across calls.
+    """
+    rc = lib.metal_batched_solve_resident(bufA.handle, bufR.handle, bufX.handle,
+                                          bufP.handle if bufP is not None else None,
+                                          c_int64(batch), c_int64(n))
+    if rc:
+        raise RuntimeError(f"metal_batched_solve_resident rc={rc}")
 
 
 def batched_solve_cpu(A, rhs):

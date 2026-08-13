@@ -171,6 +171,28 @@ TEST(BatchedSolveHandlesRaggedBatch) {
   }
 }
 
+// The resident path must be BIT-IDENTICAL to the host path, not merely close: it runs
+// the same kernel on the same data and differs only in who owns the buffers. Any
+// discrepancy means the host wrapper is copying or converting something it should not.
+TEST(BatchedSolveResidentMatchesHostPath) {
+  const int64_t n = 6, batch = 4096;
+  auto A = randv((size_t)(batch * n * n), 77);
+  auto rhs = randv((size_t)(batch * n), 78);
+  auto host = run(A, rhs, batch, n);
+
+  MetalContext& ctx = testutil::ctx();
+  Dispatcher disp(ctx);
+  auto dA = ctx.from_host(A.data(), {batch, n, n}, DType::F32);
+  auto dR = ctx.from_host(rhs.data(), {batch, n}, DType::F32);
+  auto dX = ctx.alloc({batch, n}, DType::F32);
+  auto dP = ctx.alloc({batch}, DType::F32);
+  batched_solve_f32(bs_lib(), disp, *dA, *dR, *dX, *dP, batch, n);
+  disp.wait();
+
+  const float* xp = static_cast<const float*>(dX->contents());
+  for (int64_t i = 0; i < batch * n; ++i) CHECK(xp[i] == host.x[(size_t)i]);
+}
+
 // Sizes outside the supported range must fail loudly rather than silently doing
 // something slow or wrong -- above n=8 Apple's batched MPS LU is the right answer.
 TEST(BatchedSolveRejectsUnsupportedSizes) {
