@@ -19,7 +19,7 @@ questions, because a feature that cannot answer them is not finished:
 
 | Feature | Since | Summary |
 |---|---|---|
-| [features/GPU_CHOLESKY.md](features/GPU_CHOLESKY.md) | v0.4.0 | Blocked right-looking Cholesky, one command buffer, MPS GEMM for the trailing update. Parity with direct LAPACK at N=4096, 13× faster than Apple's own MPS Cholesky. |
+| [features/GPU_CHOLESKY.md](features/GPU_CHOLESKY.md) | v0.4.0 | Blocked right-looking Cholesky, one command buffer, MPS GEMM for the trailing update. Parity with direct LAPACK at N=4096, 13× faster than Apple's own MPS Cholesky. Records two refuted optimisations. |
 | [features/COMPENSATED_REDUCTIONS.md](features/COMPENSATED_REDUCTIONS.md) | v0.3.0 | Neumaier f32 summation. 127× more accurate than a tree sum on adversarial input, at no measurable cost. Works around Apple GPUs having no `float64`. |
 | [features/CHUNKED_TRAINING.md](features/CHUNKED_TRAINING.md) | v0.2.0 | Many SGD steps per Metal command buffer. Cut MLP per-step cost ~4.4× and moved the GPU-beats-CPU crossover from batch >2048 to ~60. |
 | [features/DEVICE_ROUTING.md](features/DEVICE_ROUTING.md) | v0.2.0 | `Mlp(device="auto")`. Picks GPU or CPU from a measured crossover model, because the GPU is not faster at every size. |

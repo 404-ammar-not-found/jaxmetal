@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace jaxmetal {
@@ -20,8 +21,17 @@ namespace jaxmetal {
 // hold an NB x NB block in threadgroup memory, so NB=64 is 16 KB against the 32 KB
 // Apple GPUs provide. NB=128 would need 64 KB and does not fit. Must match CHOL_NB in
 // kernels/cholesky.metal.
-constexpr int64_t kCholNB = 64;
+constexpr int64_t kCholNB = 64;   // default; JAXMETAL_CHOL_NB overrides for sweeps
 constexpr NSUInteger kCholTG = 256;   // must match CHOL_TG
+
+// Block-column strips per trailing update. A22 is symmetric but MPS has no SYRK, so
+// one square GEMM computes both triangles and wastes half the FLOPs; P strips would
+// cut the computed area from m^2 to m^2(P+1)/2P. MEASURED AND REFUTED: at N=4096,
+// P=1 -> 46.1 ms, P=2 -> 46.1, P=4 -> 48.7, P=8 -> 57.6, P=16 -> 71.1. Halving the
+// FLOPs does not help because the trailing GEMM is not compute-bound at rank 64 (502
+// GFLOP/s at M=2048), so narrower strips land in an even less efficient regime and add
+// an MPS encode each. Kept at 1, with JAXMETAL_CHOL_STRIPS to reproduce the sweep.
+constexpr int64_t kCholStrips = 1;
 
 namespace {
 struct CholDims { uint32_t n, k, nb, m; };
@@ -73,8 +83,12 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
     auto begin = [&]() { if (!enc) enc = [cmd computeCommandEncoder]; };
     auto flush = [&]() { if (enc) { [enc endEncoding]; enc = nil; } };
 
-    for (int64_t k = 0; k < N; k += kCholNB) {
-      const int64_t nb = std::min<int64_t>(kCholNB, N - k);
+    static const int64_t kNB = [] {
+      if (const char* e = getenv("JAXMETAL_CHOL_NB")) return (int64_t)atoi(e);
+      return kCholNB;
+    }();
+    for (int64_t k = 0; k < N; k += kNB) {
+      const int64_t nb = std::min<int64_t>(kNB, N - k);
       const int64_t m = N - k - nb;
       CholDims d{(uint32_t)N, (uint32_t)k, (uint32_t)nb, (uint32_t)m};
 
@@ -106,19 +120,44 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
         // MPS documents in-place only for the decomposition kernels and is silent
         // about GEMM aliasing, so CholeskyMatchesLapack is what establishes that
         // disjoint windows are safe here.
+        //
+        // A22 is symmetric, so only its lower triangle is needed — but MPS has no
+        // SYRK, and one square GEMM computes both triangles, wasting half the FLOPs.
+        // Instead the update is issued as kCholStrips block-COLUMN strips, each
+        // covering only the rows at or below its first column:
+        //
+        //     A22[c0:m, c0:c1] -= L21[c0:m, :] · L21[c0:c1, :]ᵀ
+        //
+        // which walks the lower triangle in a staircase. With P strips the computed
+        // area is m²(P+1)/2P against the m²/2 actually needed, so waste falls from
+        // 2.00x (P=1) to 1.25x (P=4) — at the cost of P MPS encodes per block step
+        // instead of one. The strict upper triangle of A22 is left stale, which is
+        // safe because every later step reads only the lower triangle, and
+        // chol_zero_upper clears it at the end.
         flush();
-        MPSMatrix* l21 = window(a, k + nb, k, m, nb, N);
-        MPSMatrix* a22 = window(a, k + nb, k + nb, m, m, N);
-        MPSMatrixMultiplication* mm =
-            [[MPSMatrixMultiplication alloc] initWithDevice:dev
-                                              transposeLeft:NO
-                                             transposeRight:YES
-                                                 resultRows:(NSUInteger)m
-                                              resultColumns:(NSUInteger)m
-                                            interiorColumns:(NSUInteger)nb
-                                                      alpha:-1.0
-                                                       beta:1.0];
-        [mm encodeToCommandBuffer:cmd leftMatrix:l21 rightMatrix:l21 resultMatrix:a22];
+        static const int64_t kStrips = [] {
+          if (const char* e = getenv("JAXMETAL_CHOL_STRIPS")) return (int64_t)atoi(e);
+          return kCholStrips;
+        }();
+        const int64_t strips = std::min<int64_t>(kStrips, std::max<int64_t>(1, m / nb));
+        const int64_t w = (m + strips - 1) / strips;
+        for (int64_t c0 = 0; c0 < m; c0 += w) {
+          const int64_t cw = std::min<int64_t>(w, m - c0);
+          const int64_t rows = m - c0;
+          MPSMatrix* lhs = window(a, k + nb + c0, k, rows, nb, N);
+          MPSMatrix* rhs = window(a, k + nb + c0, k, cw, nb, N);
+          MPSMatrix* dst = window(a, k + nb + c0, k + nb + c0, rows, cw, N);
+          MPSMatrixMultiplication* mm =
+              [[MPSMatrixMultiplication alloc] initWithDevice:dev
+                                                transposeLeft:NO
+                                               transposeRight:YES
+                                                   resultRows:(NSUInteger)rows
+                                                resultColumns:(NSUInteger)cw
+                                              interiorColumns:(NSUInteger)nb
+                                                        alpha:-1.0
+                                                         beta:1.0];
+          [mm encodeToCommandBuffer:cmd leftMatrix:lhs rightMatrix:rhs resultMatrix:dst];
+        }
       }
     }
 

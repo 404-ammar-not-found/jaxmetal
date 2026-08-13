@@ -49,16 +49,17 @@ That API exists, but it is serial in its order: measured **150 ms at order=4096,
 nrhs=1**, scaling as O(N²). Our panel solve has order nb=64 with *m independent
 rows*, one thread each — the parallelism is m-wide, not order-wide.
 
-**NB is capped by threadgroup memory, not by GEMM efficiency.** The panel kernels
-hold an NB×NB block in threadgroup memory: NB=64 is 16 KB against the 32 KB Apple
-GPUs provide. NB=128 would need 64 KB and does not fit. This is the main thing
-holding performance back — see Limits.
+**NB=64 is a measured optimum, and the panel phases are the bottleneck** — see
+Refuted below. Both `JAXMETAL_CHOL_NB` and `JAXMETAL_CHOL_STRIPS` exist to reproduce
+those sweeps.
 
 ## Load-bearing invariants
 
-> **`RED`-style constant matching:** `CHOL_NB` and `CHOL_TG` in
-> `kernels/cholesky.metal` must equal `kCholNB` / `kCholTG` in `src/ops/cholesky.mm`.
-> The kernels size their threadgroup arrays to exactly `CHOL_NB`.
+> **`CHOL_TG` in `kernels/cholesky.metal` must equal `kCholTG` in
+> `src/ops/cholesky.mm`.** The panel kernel strides its column loop by exactly that
+> width, so a mismatch silently skips rows rather than failing loudly. NB is no longer
+> a kernel-side constant — it is passed per dispatch in `CholDims.nb`, which is what
+> lets `JAXMETAL_CHOL_NB` sweep it.
 
 > **Non-positive-definite must be reported, not silently returned.** The panel kernel
 > tests `!(s > 0.0f)` rather than `s <= 0.0f` — the latter is *false* for NaN and
@@ -98,21 +99,50 @@ the last is the honest baseline.
 
 Residual is `max|L·Lᵀ − A| / max|A|`, at 4–8e-07 throughout, i.e. a few f32 eps.
 
+## Refuted: two optimisations that measured worse
+
+Both were predicted to be substantial wins. Both are wrong, and together they
+relocate where the bottleneck actually is.
+
+**1. Approximating SYRK with block-column strips.** `A22` is symmetric, so only its
+lower triangle is needed, but MPS has no SYRK and one square GEMM computes both —
+half the FLOPs are waste. Issuing the update as P column strips walks the triangle in
+a staircase, cutting the computed area from `m²` to `m²(P+1)/2P`: 1.25× waste at P=4
+instead of 2.00×. Predicted ~1.6× faster. Measured at N=4096:
+
+| P | 1 | 2 | 4 | 8 | 16 |
+|---|---:|---:|---:|---:|---:|
+| ms | 46.1 | 46.1 | 48.7 | 57.6 | 71.1 |
+
+Halving the FLOPs does not help because **the trailing GEMM is not compute-bound at
+rank 64** — it runs at 502 GFLOP/s at M=2048, against 3297 at rank 256. Narrower
+strips land in an even less efficient regime and add an MPS encode each. Reverted to
+P=1.
+
+**2. Raising NB.** Rank-256 GEMM is 1.66× more efficient than rank-64, so a larger
+block should be a clear win. The panel kernels originally staged the NB×NB block in
+threadgroup memory, capping NB at 64 (16 KB against Apple's 32 KB); that staging was
+removed so NB could be swept. Measured at N=4096:
+
+| NB | 64 | 128 | 256 | 512 |
+|---|---:|---:|---:|---:|
+| ms | **46.1** | 64.3 | 110.8 | 227.6 |
+
+**That inversion is the real diagnosis.** If the trailing GEMM dominated, bigger NB
+would help. It does not, because `chol_panel` is one threadgroup doing O(NB³) work and
+`chol_trsm_right` is one thread per row doing O(NB²) *sequential* work — both grow
+faster than the GEMM saving. The bottleneck is the panel phases, not the update, and
+not the SYRK waste.
+
+The real fix is therefore **a blocked TRSM that expresses the panel solve as GEMMs
+too** — genuine two-level blocking. That is a different algorithm, not a tuning
+constant, which is why it is not in this version.
+
 ## Limits and things left out
 
-- **Half the GPU FLOPs are wasted.** The trailing update computes the full `m×m`
-  rectangle where only the symmetric half is needed, because **MPS has no SYRK**.
-  Fixing this is the identified path to actually beating `spotrf` — predicted ~2×,
-  which would put N=4096 at ~25 ms against LAPACK's 50 ms. The fix is to issue the
-  update as a few block-column strips instead of one square GEMM; the tradeoff is more
-  MPS encodes per step.
-- **NB=64 is too small for GEMM efficiency.** A rank-64 update at M=2048 measured only
-  502 GFLOP/s against 3297 GFLOP/s for rank-256. Raising NB needs a two-level scheme
-  (outer NB=256 whose diagonal block is itself factored by an inner NB=64 pass),
-  because the panel cannot exceed 32 KB of threadgroup memory.
 - **Below N≈2048 the CPU wins outright**, and below N≈1024 by 4–10×. The fixed
-  command-buffer cost plus the sequential panel chain dominate. This is a real regime
-  limit, not unfinished work — though the two fixes above would move the crossover.
+  command-buffer cost plus the sequential panel chain dominate.
+- **Two-level blocking is the outstanding work**, per the refutations above.
 - **LU is not implemented.** Unpivoted LU is not shippable: measured growth factor
   `max|U|/max|A|` is 4.0e3 at N=512 and `inf` on a zero leading pivot. Partial
   pivoting forces a data-dependent host decision per panel, so LU wants a MAGMA-style

@@ -21,10 +21,17 @@
 // block step — the same lesson as docs/features/CHUNKED_TRAINING.md. Correctness
 // across steps relies on Metal's intra-command-buffer hazard tracking.
 //
-// NB IS CAPPED BY THREADGROUP MEMORY, NOT BY GEMM EFFICIENCY. The panel kernels hold
-// the NB×NB diagonal block in threadgroup memory: NB=64 is 16 KB, and Apple GPUs
-// give 32 KB per threadgroup. NB=128 would need 64 KB and does not fit, which is why
-// NB is 64 even though larger blocks would make the trailing GEMM more efficient.
+// NB=64 IS A MEASURED OPTIMUM, AND THE PANEL PHASES ARE THE BOTTLENECK. Larger NB
+// makes the trailing GEMM more efficient (rank-64 at M=4096 runs at 1985 GFLOP/s,
+// rank-256 at 3297), so raising it looks like an obvious win. Measured at N=4096 it is
+// the opposite: NB=64 -> 46 ms, NB=128 -> 64 ms, NB=256 -> 111 ms, NB=512 -> 228 ms.
+// That inversion is the diagnosis — if the GEMM dominated, bigger NB would help. It
+// does not, because chol_panel is ONE threadgroup doing O(NB^3) work and
+// chol_trsm_right is one thread per row doing O(NB^2) SEQUENTIAL work, both of which
+// grow faster than the GEMM saving. Sweep it yourself with JAXMETAL_CHOL_NB.
+//
+// The real fix is a blocked TRSM that expresses the panel solve as GEMMs too, i.e.
+// genuine two-level blocking. That is a different algorithm, not a tuning constant.
 //
 // Only the lower triangle is read and written. The strictly upper triangle of the
 // result is left exactly as the caller supplied it — callers that want a clean L
@@ -36,67 +43,59 @@ using namespace metal;
 struct CholDims {
     uint n;    // full matrix order (row stride, elements)
     uint k;    // first row/col of the current block
-    uint nb;   // block size (<= CHOL_NB)
+    uint nb;   // block size for this step (host-chosen; see kCholNB)
     uint m;    // rows below the diagonal block (0 for the last block)
 };
 
-constant constexpr uint CHOL_NB = 64;   // must match kCholNB in src/ops/cholesky.mm
 constant constexpr uint CHOL_TG = 256;  // threads per threadgroup for the panel kernels
 
 // ---- 1. factor the NB x NB diagonal block, in place, with ONE threadgroup --------
 //
-// Unblocked right-looking Cholesky over the block held in threadgroup memory. The
-// column loop is inherently sequential (column j needs every column before it), so
-// there is a barrier per column: NB barriers over O(NB^3/6) work. For NB=64 that is
-// ~44 kFLOP per panel and ~2.8 MFLOP over a whole N=4096 factorisation — utterly
-// negligible beside the 46 GFLOP of trailing updates, which is exactly why it is
-// acceptable to leave this part under-parallelised.
+// Unblocked right-looking Cholesky on one threadgroup. The column loop is inherently
+// sequential (column j needs every column before it), so there is a barrier per
+// column: NB barriers over O(NB^3/6) work. At NB=64 that is ~44 kFLOP per panel, and
+// the NB sweep above shows this phase — not the trailing GEMM — is what stops NB from
+// being raised.
 kernel void chol_panel(device float*       A [[buffer(0)]],
                        constant CholDims&  d [[buffer(1)]],
                        device uint*        status [[buffer(2)]],
                        uint lid [[thread_position_in_threadgroup]]) {
-    threadgroup float T[CHOL_NB * CHOL_NB];
-    const uint nb = d.nb;
-    device float* A11 = A + (ulong)d.k * d.n + d.k;
+    const uint nb = d.nb, n = d.n;
+    device float* A11 = A + (ulong)d.k * n + d.k;
 
-    // Load the block (lower triangle is all we touch; load it all for simplicity).
-    for (uint idx = lid; idx < nb * nb; idx += CHOL_TG)
-        T[idx] = A11[(idx / nb) * (ulong)d.n + (idx % nb)];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+    // Operates directly on device memory rather than staging the block in threadgroup
+    // memory. Staging is faster per panel, but it caps NB at 64 (64x64 f32 = 16 KB
+    // against Apple's 32 KB threadgroup limit) and NB turns out to be the dominant
+    // performance lever: rank-64 trailing GEMM runs at 502 GFLOP/s where rank-256 runs
+    // at 3297. Panel work is O(NB^3) against O(N^3) of trailing update, so paying more
+    // here to allow a larger NB is the right trade.
     for (uint j = 0; j < nb; ++j) {
-        // Diagonal: L[j][j] = sqrt(A[j][j] - sum_{p<j} L[j][p]^2).
         if (lid == 0) {
-            float s = T[j * nb + j];
-            for (uint p = 0; p < j; ++p) s -= T[j * nb + p] * T[j * nb + p];
-            // Not positive definite (or NaN — note the !(s > 0) form, which catches
-            // NaN where s <= 0 would not). Record the FIRST failing column, 1-based,
-            // LAPACK `info` convention. Only lid==0 writes and panels run sequentially
-            // in the command buffer, so the read-then-write needs no atomic. Substitute
-            // a benign pivot so the trailing GEMM cannot fill the matrix with NaN and
-            // destroy the evidence of where the failure actually started.
+            float s = A11[(ulong)j * n + j];
+            for (uint p = 0; p < j; ++p) {
+                float v = A11[(ulong)j * n + p];
+                s -= v * v;
+            }
+            // !(s > 0) rather than s <= 0: the latter is FALSE for NaN and would let a
+            // NaN input through as a successful factorisation. Record the first failing
+            // column (LAPACK `info`, 1-based) and substitute a benign pivot so the
+            // trailing GEMM cannot fill the matrix with NaN and destroy the evidence.
             if (!(s > 0.0f)) {
                 if (status[0] == 0u) status[0] = d.k + j + 1u;
                 s = 1.0f;
             }
-            T[j * nb + j] = sqrt(s);
+            A11[(ulong)j * n + j] = sqrt(s);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_device);
 
-        // Column below the diagonal: L[i][j] = (A[i][j] - sum_{p<j} L[i][p]L[j][p]) / L[j][j].
-        const float djj = T[j * nb + j];
+        const float djj = A11[(ulong)j * n + j];
         for (uint i = j + 1 + lid; i < nb; i += CHOL_TG) {
-            float s = T[i * nb + j];
-            for (uint p = 0; p < j; ++p) s -= T[i * nb + p] * T[j * nb + p];
-            T[i * nb + j] = s / djj;
+            float s = A11[(ulong)i * n + j];
+            for (uint p = 0; p < j; ++p)
+                s -= A11[(ulong)i * n + p] * A11[(ulong)j * n + p];
+            A11[(ulong)i * n + j] = s / djj;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Store back the lower triangle only.
-    for (uint idx = lid; idx < nb * nb; idx += CHOL_TG) {
-        uint i = idx / nb, j = idx % nb;
-        if (i >= j) A11[i * (ulong)d.n + j] = T[idx];
+        threadgroup_barrier(mem_flags::mem_device);
     }
 }
 
@@ -104,29 +103,22 @@ kernel void chol_panel(device float*       A [[buffer(0)]],
 //
 // One thread per row of A21, so the m rows are fully independent — this is where the
 // panel-phase parallelism lives (m is up to N-NB). L11 is shared by every row, so it
-// is staged once into threadgroup memory and read from there.
+// is read straight from device memory and served by cache.
 kernel void chol_trsm_right(device float*      A [[buffer(0)]],
                             constant CholDims& d [[buffer(1)]],
-                            uint gid [[thread_position_in_grid]],
-                            uint lid [[thread_position_in_threadgroup]]) {
-    threadgroup float L11[CHOL_NB * CHOL_NB];
-    const uint nb = d.nb;
-    device const float* A11 = A + (ulong)d.k * d.n + d.k;
-
-    for (uint idx = lid; idx < nb * nb; idx += CHOL_TG) {
-        uint i = idx / nb, j = idx % nb;
-        L11[idx] = (i >= j) ? A11[i * (ulong)d.n + j] : 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+                            uint gid [[thread_position_in_grid]]) {
     if (gid >= d.m) return;
-    device float* row = A + (ulong)(d.k + nb + gid) * d.n + d.k;
+    const uint nb = d.nb, n = d.n;
+    device const float* L11 = A + (ulong)d.k * n + d.k;
+    device float* row = A + (ulong)(d.k + nb + gid) * n + d.k;
 
-    // Forward substitution along the row: row[j] = (row[j] - sum_{p<j} row[p]·L11[j][p]) / L11[j][j]
+    // Forward substitution along the row. Every thread reads the same L11, so it is
+    // left in device memory and served by cache rather than staged per threadgroup —
+    // which also removes the NB cap that staging would impose.
     for (uint j = 0; j < nb; ++j) {
         float s = row[j];
-        for (uint p = 0; p < j; ++p) s -= row[p] * L11[j * nb + p];
-        row[j] = s / L11[j * nb + j];
+        for (uint p = 0; p < j; ++p) s -= row[p] * L11[(ulong)j * n + p];
+        row[j] = s / L11[(ulong)j * n + j];
     }
 }
 
