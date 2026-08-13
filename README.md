@@ -7,7 +7,7 @@ with `jax.jit` through an XLA FFI custom call.
 
 ![platform](https://img.shields.io/badge/platform-macOS%20·%20Apple%20Silicon-black)
 ![stack](https://img.shields.io/badge/C%2B%2B17%20·%20Metal%20·%20MPS%20·%20Python-blue)
-![tests](https://img.shields.io/badge/tests-52%20C%2B%2B%20%2B%20Python%20gate-brightgreen)
+![tests](https://img.shields.io/badge/tests-68%20C%2B%2B%20%2B%20Python%20gate-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Kernels are hand-written; the project does not use MPSGraph or any existing ML framework for
@@ -42,7 +42,11 @@ command buffer, so the driver round trip is paid once per chunk rather than once
   as a gate before every training run.
 - **Hand-written MSL kernel set.** Register-tiled GEMM, axis reductions, transpose, fused
   numerically stable softmax cross-entropy, ReLU and its gradient, and the SGD update. Each is
-  unit-tested against a double-precision CPU implementation across 52 C++ tests.
+  unit-tested against a double-precision CPU implementation across 68 C++ tests.
+- **Scientific-computing kernels.** Blocked Cholesky (parity with direct LAPACK at
+  N=4096, 13x faster than Apple's own MPS decomposition), batched solves for thousands
+  of tiny systems (2-3x a scalar C loop, 15-24x numpy batched), and double-single
+  ~48-bit arithmetic for a GPU with no `double` type. See [docs/](docs/).
 - **Compensated f32 summation.** Apple GPUs have no `float64` at all, so the usual "promote to
   double" fix for large-sum error cannot run on-device. Neumaier compensated summation recovers
   it in f32 — **127× more accurate than a tree sum on adversarial input, at no measurable cost**
@@ -74,7 +78,7 @@ cmake --build build
 .venv/bin/python examples/train_mnist.py --batch 512 --hidden 1024 --lr 0.5 --epochs 25
 
 # 4. Run the test suites.
-ctest --test-dir build --output-on-failure        # 52 C++ unit tests
+ctest --test-dir build --output-on-failure        # 68 C++ unit tests
 .venv/bin/python tests/python/test_mlp_gate.py    # GPU MLP against the golden reference
 .venv/bin/python tests/python/test_mlp_auto.py    # chunked == per-step; router against the clock
 ```
@@ -230,7 +234,7 @@ kernels/            Hand-written MSL: elementwise, matmul, nn (embedded, compile
 python/jaxmetal/    Package: __init__ (public API), _capi (ctypes), ffi, data, reference, plugin
 examples/           train_mnist, backends_and_batching, jit_ffi, ffi_jit, resident_speed, matmul_showcase
 benchmarks/         bench_matmul.py (MPS versus hand-written kernel versus CPU)
-tests/cpp/          52 C++ unit tests, exposed as individual ctest cases
+tests/cpp/          68 C++ unit tests, exposed as individual ctest cases
 tests/python/       Front-end tests, the MLP correctness gate, and the router gate
 docs/               README.md (index), ARCHITECTURE.md, PJRT_PLUGIN.md, features/, images/
 ```
