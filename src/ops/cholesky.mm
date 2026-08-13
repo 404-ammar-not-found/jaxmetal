@@ -23,7 +23,10 @@ namespace jaxmetal {
 // Apple GPUs provide. NB=128 would need 64 KB and does not fit. Must match CHOL_NB in
 // kernels/cholesky.metal.
 constexpr int64_t kCholNB = 64;   // default; JAXMETAL_CHOL_NB overrides for sweeps
-constexpr NSUInteger kCholTG = 256;   // must match CHOL_TG
+constexpr NSUInteger kCholTG = 256;         // must match CHOL_TG
+constexpr NSUInteger kCholPanelTG = 32;     // must match CHOL_PANEL_TG: exactly one
+                                            // SIMD group, so the panel's per-column
+                                            // barrier is a simdgroup_barrier
 
 // Block-column strips per trailing update. A22 is symmetric but MPS has no SYRK, so
 // one square GEMM computes both triangles and wastes half the FLOPs; P strips would
@@ -67,12 +70,45 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
     return (__bridge id<MTLComputePipelineState>)lib.pipeline(name);
   };
   id<MTLComputePipelineState> pso_panel = pso("chol_panel");
-  id<MTLComputePipelineState> pso_trsm = pso("chol_trsm_right");
+  static const bool kChunkedTrsm = [] {
+    if (const char* e = getenv("JAXMETAL_CHOL_TRSM_CHUNKED")) return atoi(e) != 0;
+    return false;
+  }();
+  id<MTLComputePipelineState> pso_trsm =
+      pso(kChunkedTrsm ? "chol_trsm_right_chunked" : "chol_trsm_right");
   id<MTLComputePipelineState> pso_zero = pso("chol_zero_upper");
+
+  // TRSM strategy: "gemm" inverts the diagonal block and turns the panel solve into
+  // an MPS GEMM; "kernel" uses the hand-written per-row substitution.
+  static const bool kGemmTrsm = [] {
+    if (const char* e = getenv("JAXMETAL_CHOL_TRSM")) return std::string(e) == "gemm";
+    return true;
+  }();
+  id<MTLComputePipelineState> pso_inv = pso("chol_invert_panel");
+  id<MTLComputePipelineState> pso_copy = pso("chol_copy_panel");
+
+  // Scratch: the nb x nb inverse, and the m x nb GEMM result (which cannot alias its
+  // own input, so it is written here and copied back).
+  auto linv = ctx.alloc({kCholNB, kCholNB}, DType::F32);
+  auto panel = ctx.alloc({N, kCholNB}, DType::F32);
+  id<MTLBuffer> bl = (__bridge id<MTLBuffer>)linv->mtl_handle();
+  id<MTLBuffer> bp = (__bridge id<MTLBuffer>)panel->mtl_handle();
 
   auto status = ctx.alloc({1}, DType::I32);
   *static_cast<uint32_t*>(status->contents()) = 0u;   // nothing in flight yet
   id<MTLBuffer> st = (__bridge id<MTLBuffer>)status->mtl_handle();
+
+  // Per-phase GPU-time attribution. Puts each phase in its own command buffer and
+  // sums MTLCommandBuffer GPUStartTime/GPUEndTime, which is the GPU's own clock. This
+  // exists because the cheaper JAXMETAL_CHOL_PHASES approach (skip a phase, time the
+  // rest) is NOT additive -- its numbers summed to more than the whole -- and six
+  // optimisations were attempted against the wrong diagnosis as a result. Slower than
+  // the real path because it adds a round trip per phase; only the ratios are useful.
+  static const bool kProfilePhases = [] {
+    const char* e = getenv("JAXMETAL_CHOL_PROFILE");
+    return e && atoi(e) != 0;
+  }();
+  double g_panel = 0.0, g_trsm = 0.0, g_gemm = 0.0;
 
   @autoreleasepool {
     // ONE command buffer for every block step. Metal hazard-tracks within a command
@@ -111,6 +147,15 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
       if (const char* e = getenv("JAXMETAL_CHOL_NB")) return (int64_t)atoi(e);
       return kCholNB;
     }();
+    auto phase_end = [&](double* acc) {
+      if (!kProfilePhases) return;
+      flush();
+      [cmd commit];
+      [cmd waitUntilCompleted];
+      *acc += cmd.GPUEndTime - cmd.GPUStartTime;
+      cmd = [queue commandBuffer];
+    };
+
     for (int64_t k = 0; k < N; k += kNB) {
       const int64_t nb = std::min<int64_t>(kNB, N - k);
       const int64_t m = N - k - nb;
@@ -126,10 +171,46 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
       [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(kCholTG, 1, 1)];
       }
+      phase_end(&g_panel);
 
       if (m > 0) {
         if (do_trsm) {
-        if (kMpsTrsm) {
+        if (kGemmTrsm && nb == kCholNB) {
+          // Panel solve as a GEMM: invert L11 once, then L21 = A21 * (L11^-1)^T.
+          // The solve was 65% of the factorisation at ~19 GFLOP/s; the GEMM phase
+          // measured ~0.5%. Five attempts to speed up the solve directly all measured
+          // flat or worse, so this removes it instead of optimising it.
+          begin();
+          [enc setComputePipelineState:pso_inv];
+          [enc setBuffer:a offset:0 atIndex:0];
+          [enc setBuffer:bl offset:0 atIndex:1];
+          [enc setBytes:&d length:sizeof(d) atIndex:2];
+          [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(kCholTG, 1, 1)];
+          flush();
+
+          MPSMatrix* a21 = window(a, k + nb, k, m, nb, N);
+          MPSMatrix* mli = window(bl, 0, 0, nb, nb, nb);
+          MPSMatrix* mpanel = window(bp, 0, 0, m, nb, nb);
+          MPSMatrixMultiplication* mm =
+              [[MPSMatrixMultiplication alloc] initWithDevice:dev
+                                                transposeLeft:NO
+                                               transposeRight:YES
+                                                   resultRows:(NSUInteger)m
+                                                resultColumns:(NSUInteger)nb
+                                              interiorColumns:(NSUInteger)nb
+                                                        alpha:1.0
+                                                         beta:0.0];
+          [mm encodeToCommandBuffer:cmd leftMatrix:a21 rightMatrix:mli resultMatrix:mpanel];
+
+          begin();
+          [enc setComputePipelineState:pso_copy];
+          [enc setBuffer:bp offset:0 atIndex:0];
+          [enc setBuffer:a offset:0 atIndex:1];
+          [enc setBytes:&d length:sizeof(d) atIndex:2];
+          [enc dispatchThreads:MTLSizeMake((NSUInteger)(m * nb), 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(kCholTG, 1, 1)];
+        } else if (kMpsTrsm) {
           // MPSMatrixSolveTriangular at ORDER=nb (64) with m right-hand sides.
           // This API was dismissed earlier on a measurement at order=4096, where it
           // is serial in the order and takes 150 ms. That was the wrong regime: the
@@ -176,6 +257,8 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
         // about GEMM aliasing, so CholeskyMatchesLapack is what establishes that
         // disjoint windows are safe here.
         //
+        phase_end(&g_trsm);
+
         // A22 is symmetric, so only its lower triangle is needed — but MPS has no
         // SYRK, and one square GEMM computes both triangles, wasting half the FLOPs.
         // Instead the update is issued as kCholStrips block-COLUMN strips, each
@@ -213,6 +296,7 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
                                                          beta:1.0];
           [mm encodeToCommandBuffer:cmd leftMatrix:lhs rightMatrix:rhs resultMatrix:dst];
         }
+        phase_end(&g_gemm);
       }
     }
 
@@ -230,6 +314,10 @@ int cholesky_f32(MetalContext& ctx, KernelLibrary& lib, MetalBuffer& A, int64_t 
     [cmd waitUntilCompleted];
   }
 
+  if (kProfilePhases) {
+    fprintf(stderr, "[chol N=%lld] panel=%.1fms trsm=%.1fms gemm=%.1fms\n",
+            (long long)N, g_panel * 1e3, g_trsm * 1e3, g_gemm * 1e3);
+  }
   return (int)*static_cast<const uint32_t*>(status->contents());
 }
 

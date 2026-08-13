@@ -82,10 +82,10 @@ those sweeps.
 
 | N | jaxmetal | GF/s | `spotrf` | GF/s | vs spotrf | `np.linalg.cholesky` | vs numpy | residual |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 512 | 6.12 ms | 7 | 0.36 ms | 123 | 0.06× | 1.34 ms | 0.22× | 4.3e-07 |
-| 1024 | 8.24 ms | 43 | 1.92 ms | 186 | 0.23× | 6.32 ms | 0.77× | 5.4e-07 |
-| 2048 | 16.79 ms | 171 | 8.88 ms | 322 | 0.53× | 37.40 ms | 2.23× | 6.8e-07 |
-| 4096 | 46.49 ms | 493 | **54.82 ms** | 418 | **1.18×** | 191.79 ms | 4.13× | 8.0e-07 |
+| 512 | 5.56 ms | 8 | 0.38 ms | 119 | 0.07× | 1.29 ms | 0.23× | 4.3e-07 |
+| 1024 | 9.48 ms | 38 | 1.90 ms | 189 | 0.20× | 6.22 ms | 0.66× | 5.4e-07 |
+| 2048 | 17.45 ms | 164 | 8.43 ms | 340 | 0.48× | 35.15 ms | 2.01× | 6.2e-07 |
+| 4096 | 48.03 ms | 477 | **51.14 ms** | 448 | **1.06×** | 181.04 ms | 3.77× | 8.0e-07 |
 
 Run-to-run variance on this machine is roughly ±15% under sustained benchmarking
 (thermal), so treat 1.1–1.2× as "parity, slightly ahead" rather than a precise figure.
@@ -106,21 +106,35 @@ Residual is `max|L·Lᵀ − A| / max|A|`, at 4–8e-07 throughout, i.e. a few f
 
 ## Where the time actually goes
 
-Measured by phase at N=4096 (`JAXMETAL_CHOL_PHASES` selects `p`anel/`t`rsm/`g`emm;
-skipping a phase gives wrong results and exists only for attribution):
+Use `JAXMETAL_CHOL_PROFILE=1`, which puts each phase in its own command buffer and
+sums the GPU's own clock (`MTLCommandBuffer.GPUStartTime`/`GPUEndTime`). At N=4096 the
+three phases are **roughly balanced**:
 
-| phase | time | share |
+| phase | GPU time | share |
 |---|---:|---:|
-| **TRSM** (`chol_trsm_right`) | ~29 ms | **~65%** |
-| panel (`chol_panel`) | ~16 ms | ~35% |
-| trailing MPS GEMM | ~0.25 ms | **~0.5%** |
+| panel (`chol_panel`) | ~19–27 ms | ~40% |
+| trailing MPS GEMM | ~24–26 ms | ~38% |
+| TRSM (`chol_trsm_right`) | ~15–18 ms | ~22% |
 
-**The trailing GEMM is essentially free.** That is the opposite of the assumption this
-feature was designed on — "only the panel is hand-written, the GEMM carries all the
-FLOPs" — and it explains every failed optimisation below. The panel *phases* are the
-factorisation.
+> **An earlier attribution here was wrong, and six optimisations were attempted
+> against it.** `JAXMETAL_CHOL_PHASES` (skip a phase, time the rest) reported "TRSM
+> 65%, GEMM 0.5%". That method is invalid: its numbers are not additive — the isolated
+> phases summed to *more* than the whole run — because skipping a phase leaves the
+> matrix holding different values, which changes what the remaining phases cost. The
+> flag is kept only as a rough cross-check; trust `JAXMETAL_CHOL_PROFILE`.
 
-## Refuted: four optimisations that measured worse or flat
+No phase dominates, which is why every single-phase optimisation below moved the total
+so little. The panel is the largest and does only ~2.8 MMAC over the whole
+factorisation (~0.2 GFLOP/s), so it is pure latency: 64 columns × 64 blocks = 4096
+sequential steps, each with a serial diagonal computation and a barrier. That chain is
+Cholesky's inherent data dependency, not an implementation artefact.
+
+## Refuted: eight optimisations that measured worse or flat
+
+Recorded in full because the aggregate finding is more useful than any of them
+individually: **this factorisation has no single hot spot to attack.** Its three phases
+are within 2× of each other, and its largest is a latency chain that is intrinsic to
+the algorithm.
 
 All three were predicted to be wins. None are, and together they relocate the
 bottleneck.
@@ -175,6 +189,28 @@ that MPS TRSM's cost is nearly flat in m (0.405 ms at m=512, 0.264 ms at m=4096)
 which is the signature of a fixed overhead rather than useful work. Reverted;
 reproduce with `JAXMETAL_CHOL_MPS_TRSM=1`.
 
+**5. One SIMD group for the panel** instead of a 256-thread threadgroup, so the
+per-column barrier becomes `simdgroup_barrier` (lanes already run in lockstep) rather
+than a full `threadgroup_barrier` — 4096 of them across a factorisation. Measured:
+panel 27.1 ms → **32.1 ms**. The lost parallelism in the column update costs more than
+the cheaper barrier saves.
+
+**6. Threadgroup staging for the panel**, on the theory its dependent inner loop was
+device-memory-latency bound. Measured: panel 27.1 ms → **28.9 ms**, no better, and it
+caps NB at 64 (16 KB against Apple's 32 KB). Left operating on device memory, which is
+simpler and keeps `JAXMETAL_CHOL_NB` able to sweep.
+
+**7. Inverting the diagonal block so the panel solve becomes a GEMM.** The textbook fix
+and what MAGMA does: form `L11⁻¹` once per step (O(nb³/6), ~2.8 MMAC total) and the
+solve becomes `L21 = A21 · (L11⁻¹)ᵀ`, a pure GEMM. Measured end to end: **49.0 ms
+against 44.9 ms**. The GEMM is `m×64 @ 64×64` — too narrow to be efficient — and the
+inverse and copy-back kernels add two more dispatches per step. Residual was unharmed
+(6.2e-07 vs 6.8e-07), so the stability trade was fine; it just was not faster. Kept
+behind `JAXMETAL_CHOL_TRSM=gemm`.
+
+**8. Chunking the TRSM row into 16 registers** instead of 64, to raise occupancy.
+Measured: TRSM 29.8 ms → **30.8 ms**. Register pressure is not the limit either.
+
 What *did* help, modestly: holding each thread's row in registers instead of
 re-reading `row[p]` from device memory inside the inner loop (46.6 → 44.7 ms overall,
 TRSM 31.6 → 29.1 ms, ~8% on the phase). At 64 floats per thread `r` is likely
@@ -189,7 +225,13 @@ not in this version.
 
 - **Below N≈2048 the CPU wins outright**, and below N≈1024 by 4–10×. The fixed
   command-buffer cost plus the sequential panel chain dominate.
-- **Two-level blocking is the outstanding work**, per the refutations above.
+- **Two-level blocking is no longer the obvious next step.** It was proposed on the
+  belief that the TRSM was 65% of runtime; with the corrected attribution the TRSM is
+  22% and the phases are balanced, so restructuring to turn the panel solve into GEMMs
+  addresses the smallest phase. Refutation 7 already tested that idea in miniature and
+  it lost. Any real gain now has to attack the panel's sequential chain — which means a
+  fundamentally different algorithm (a left-looking or recursive formulation), not a
+  restructuring of this one.
 - **LU is not implemented.** Unpivoted LU is not shippable: measured growth factor
   `max|U|/max|A|` is 4.0e3 at N=512 and `inf` on a zero leading pivot. Partial
   pivoting forces a data-dependent host decision per panel, so LU wants a MAGMA-style

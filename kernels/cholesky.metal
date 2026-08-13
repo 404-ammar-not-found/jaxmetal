@@ -56,6 +56,20 @@ constant constexpr uint CHOL_TG = 256;  // threads per threadgroup for the panel
 // column: NB barriers over O(NB^3/6) work. At NB=64 that is ~44 kFLOP per panel, and
 // the NB sweep above shows this phase — not the trailing GEMM — is what stops NB from
 // being raised.
+// THE PANEL IS THE LARGEST PHASE, AND IT RESISTS OPTIMISATION. Measured with GPU
+// timestamps at N=4096: panel 27.1 ms, TRSM 15.2 ms, trailing GEMM 26.1 ms. It does
+// only ~2.8 MMAC over the whole factorisation, i.e. ~0.2 GFLOP/s, so it is entirely
+// latency: 64 columns x 64 blocks = 4096 sequential steps, each with a serial section
+// (the diagonal) and a barrier. That chain is Cholesky's inherent dependency.
+//
+// Tried and measured, none of which helped (all in the feature doc):
+//   * threadgroup staging of the block: panel 28.9 ms (no better; and it caps NB=64)
+//   * one SIMD group with simdgroup_barrier instead of 256 threads with
+//     threadgroup_barrier: panel 32.1 ms (lost column parallelism costs more than the
+//     cheaper barrier saves)
+//
+// Left operating directly on device memory: simplest, marginally fastest, and it does
+// not cap NB, which keeps JAXMETAL_CHOL_NB able to sweep.
 kernel void chol_panel(device float*       A [[buffer(0)]],
                        constant CholDims&  d [[buffer(1)]],
                        device uint*        status [[buffer(2)]],
@@ -63,12 +77,6 @@ kernel void chol_panel(device float*       A [[buffer(0)]],
     const uint nb = d.nb, n = d.n;
     device float* A11 = A + (ulong)d.k * n + d.k;
 
-    // Operates directly on device memory rather than staging the block in threadgroup
-    // memory. Staging is faster per panel, but it caps NB at 64 (64x64 f32 = 16 KB
-    // against Apple's 32 KB threadgroup limit) and NB turns out to be the dominant
-    // performance lever: rank-64 trailing GEMM runs at 502 GFLOP/s where rank-256 runs
-    // at 3297. Panel work is O(NB^3) against O(N^3) of trailing update, so paying more
-    // here to allow a larger NB is the right trade.
     for (uint j = 0; j < nb; ++j) {
         if (lid == 0) {
             float s = A11[(ulong)j * n + j];
@@ -163,6 +171,126 @@ kernel void chol_trsm_right(device float*      A [[buffer(0)]],
         for (uint p = 0; p < j; ++p) s -= row[p] * src[(ulong)j * n + p];
         row[j] = s / src[(ulong)j * n + j];
     }
+}
+
+// ---- 2b. chunked variant: fewer registers, higher occupancy ---------------------
+//
+// The full-row variant above holds all CHOL_NB=64 floats of a row in registers. That
+// is ~64 registers per thread before anything else, which on Apple GPUs collapses
+// occupancy -- and occupancy, not arithmetic, is what limits this kernel: it does only
+// ~273 MMAC in total across an N=4096 factorisation yet runs at ~19 GFLOP/s against a
+// ~5000 GFLOP/s machine.
+//
+// This variant keeps only CHOL_CH columns live at a time. Columns already solved are
+// re-read from device memory (this thread's own row, 256 contiguous bytes, so it stays
+// in cache). Trades a little extra traffic for a lot more threads in flight.
+constant constexpr uint CHOL_CH = 16;
+
+kernel void chol_trsm_right_chunked(device float*      A [[buffer(0)]],
+                                    constant CholDims& d [[buffer(1)]],
+                                    uint gid [[thread_position_in_grid]],
+                                    uint lid [[thread_position_in_threadgroup]]) {
+    threadgroup float L11[CHOL_NB * CHOL_NB];
+    const uint nb = d.nb, n = d.n;
+    device const float* src = A + (ulong)d.k * n + d.k;
+
+    if (nb == CHOL_NB) {
+        for (uint idx = lid; idx < CHOL_NB * CHOL_NB; idx += CHOL_TG) {
+            uint i = idx / CHOL_NB, j = idx % CHOL_NB;
+            L11[idx] = (i >= j) ? src[(ulong)i * n + j] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (gid >= d.m) return;
+    device float* row = A + (ulong)(d.k + nb + gid) * n + d.k;
+
+    if (nb != CHOL_NB) {
+        for (uint j = 0; j < nb; ++j) {
+            float s = row[j];
+            for (uint p = 0; p < j; ++p) s -= row[p] * src[(ulong)j * n + p];
+            row[j] = s / src[(ulong)j * n + j];
+        }
+        return;
+    }
+
+    #pragma unroll
+    for (uint jb = 0; jb < CHOL_NB; jb += CHOL_CH) {
+        float r[CHOL_CH];
+        #pragma unroll
+        for (uint t = 0; t < CHOL_CH; ++t) r[t] = row[jb + t];
+
+        #pragma unroll
+        for (uint t = 0; t < CHOL_CH; ++t) {
+            const uint j = jb + t;
+            float s = r[t];
+            for (uint p = 0; p < jb; ++p) s -= row[p] * L11[j * CHOL_NB + p];
+            #pragma unroll
+            for (uint u = 0; u < CHOL_CH; ++u)
+                if (u < t) s -= r[u] * L11[j * CHOL_NB + jb + u];
+            r[t] = s / L11[j * CHOL_NB + j];
+        }
+
+        #pragma unroll
+        for (uint t = 0; t < CHOL_CH; ++t) row[jb + t] = r[t];
+    }
+}
+
+// ---- 2c. invert the diagonal block, so the panel solve becomes a GEMM -----------
+//
+// THE POINT. The panel solve L21 = A21 * L11^-T is 65% of this factorisation and runs
+// at ~19 GFLOP/s on a ~5000 GFLOP/s machine. Five attempts to make the solve itself
+// faster all measured flat or worse (see the feature doc). So instead: form L11^-1
+// explicitly, once per block step, and the solve becomes L21 = A21 * (L11^-1)^T --
+// a pure GEMM, which the phase breakdown shows costs essentially nothing here.
+//
+// The inverse costs O(nb^3/6) ~ 44 kMAC per step and ~2.8 MMAC over an N=4096
+// factorisation, against 273 MMAC for the solve it replaces.
+//
+// NUMERICAL NOTE: explicit inversion is less backward-stable than a triangular solve.
+// It is acceptable here for the same reason MAGMA does it -- L11 is the Cholesky
+// factor of a diagonal block of an SPD matrix, so it is well conditioned -- but it is
+// a real trade, and CholeskyMatchesLapack's residual check is what bounds it.
+//
+// One thread per COLUMN of the inverse: column j is the solution of L*x = e_j, found
+// by forward substitution. Columns are independent.
+kernel void chol_invert_panel(device const float* A    [[buffer(0)]],
+                              device float*       Linv [[buffer(1)]],
+                              constant CholDims&  d    [[buffer(2)]],
+                              uint lid [[thread_position_in_threadgroup]]) {
+    threadgroup float L[CHOL_NB * CHOL_NB];
+    const uint nb = d.nb, n = d.n;
+    device const float* src = A + (ulong)d.k * n + d.k;
+
+    for (uint idx = lid; idx < nb * nb; idx += CHOL_TG) {
+        uint i = idx / nb, j = idx % nb;
+        L[idx] = (i >= j) ? src[(ulong)i * n + j] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Zero the whole tile first: the strict upper triangle of Linv must be 0 for the
+    // GEMM that consumes it to be correct.
+    for (uint idx = lid; idx < nb * nb; idx += CHOL_TG) Linv[idx] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (lid >= nb) return;
+    const uint j = lid;
+    // x = L^-1 e_j : x[i] = 0 for i<j, then forward substitution.
+    for (uint i = j; i < nb; ++i) {
+        float s = (i == j) ? 1.0f : 0.0f;
+        for (uint p = j; p < i; ++p) s -= L[i * nb + p] * Linv[p * nb + j];
+        Linv[i * nb + j] = s / L[i * nb + i];
+    }
+}
+
+// out[m, nb] -> A[k+nb.., k..], copying the GEMM result back into the matrix.
+kernel void chol_copy_panel(device const float* src [[buffer(0)]],
+                            device float*       A   [[buffer(1)]],
+                            constant CholDims&  d   [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]]) {
+    const uint nb = d.nb, n = d.n;
+    if (gid >= d.m * nb) return;
+    const uint i = gid / nb, j = gid % nb;
+    A[(ulong)(d.k + nb + i) * n + d.k + j] = src[gid];
 }
 
 // ---- zero the strictly upper triangle, so the result is a clean L ---------------
