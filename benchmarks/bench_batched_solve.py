@@ -55,8 +55,8 @@ def make(batch: int, n: int, seed: int = 0):
 
 def throughput(batch: int) -> None:
     print(f"\n=== throughput at batch = {batch:,} (systems/second) ===\n")
-    hdr = (f"{'n':>3} {'GPU host':>12} {'GPU resident':>13} {'C loop':>12} "
-           f"{'numpy':>12} {'res vs C':>9} {'resid':>9}")
+    hdr = (f"{'n':>3} {'GPU host':>11} {'resident LU':>12} {'resident SPD':>13} "
+           f"{'C loop':>11} {'res vs C':>9} {'SPD gain':>9}")
     print(hdr)
     print("-" * len(hdr))
 
@@ -76,15 +76,22 @@ def throughput(batch: int) -> None:
         bX = _capi.DeviceBuffer.from_numpy(np.zeros(batch * n, np.float32))
         t_res = best(lambda: _capi.batched_solve_resident(bA, bR, bX, batch, n))
 
+        # SPD variant: same systems made positive definite, solved by Cholesky.
+        # Strictly less work (n^3/6 vs n^3/3) and no pivot search or row interchange.
+        M = A.copy()
+        Aspd = np.ascontiguousarray(M @ M.transpose(0, 2, 1) + n * np.eye(n, dtype=np.float32))
+        bS = _capi.DeviceBuffer.from_numpy(Aspd.ravel())
+        t_spd = best(lambda: _capi.batched_solve_resident(bS, bR, bX, batch, n, spd=True))
+
         x = jaxmetal.batched_solve(A, rhs)
         r = np.einsum("bij,bj->bi", A.astype(np.float64), x.astype(np.float64)) - rhs
         anorm = np.abs(A).sum(axis=2).max(axis=1)
         xnorm = np.abs(x).max(axis=1)
         resid = float((np.abs(r).max(axis=1) / (anorm * np.maximum(xnorm, 1e-30))).max())
 
-        print(f"{n:>3} {batch/t_gpu:>12.3e} {batch/t_res:>13.3e} {batch/t_c:>12.3e} "
-              f"{batch/t_np:>12.3e} {t_c/t_res:>8.1f}x {resid:>9.1e}")
-        del bA, bR, bX
+        print(f"{n:>3} {batch/t_gpu:>11.3e} {batch/t_res:>12.3e} {batch/t_spd:>13.3e} "
+              f"{batch/t_c:>11.3e} {t_c/t_res:>8.1f}x {t_res/t_spd:>8.2f}x")
+        del bA, bR, bX, bS
 
 
 def crossover(n: int = 6) -> None:

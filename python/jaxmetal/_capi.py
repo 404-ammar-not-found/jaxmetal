@@ -19,7 +19,7 @@ __all__ = [
     "matmul_resident", "matmul_resident_mps",
     "reduce_sum", "reduce_sum_resident", "cholesky", "cholesky_resident",
     "batched_solve", "batched_solve_cpu", "batched_solve_resident",
-    "df64_binop", "df64_stencil3", "to_df64", "from_df64",
+    "df64_binop", "df64_binop_resident", "df64_stencil3", "to_df64", "from_df64",
     "Mlp",
 ]
 
@@ -109,16 +109,18 @@ lib.metal_cholesky_resident.restype = c_int
 lib.metal_cholesky_f32.argtypes = [_f32, c_int64]
 lib.metal_cholesky_f32.restype = c_int
 
-lib.metal_batched_solve_f32.argtypes = [_f32, _f32, _f32, _f32, c_int64, c_int64]
+lib.metal_batched_solve_f32.argtypes = [_f32, _f32, _f32, _f32, c_int64, c_int64, c_int]
 lib.metal_batched_solve_f32.restype = c_int
 lib.metal_batched_solve_resident.argtypes = [c_void_p, c_void_p, c_void_p, c_void_p,
-                                             c_int64, c_int64]
+                                             c_int64, c_int64, c_int]
 lib.metal_batched_solve_resident.restype = c_int
 lib.metal_batched_solve_cpu_f32.argtypes = [_f32, _f32, _f32, c_int64, c_int64]
 lib.metal_batched_solve_cpu_f32.restype = None
 
 lib.metal_df64_binop.argtypes = [_f32, _f32, _f32, c_int64, c_int]
 lib.metal_df64_binop.restype = c_int
+lib.metal_df64_binop_resident.argtypes = [c_void_p, c_void_p, c_void_p, c_int64, c_int]
+lib.metal_df64_binop_resident.restype = c_int
 lib.metal_df64_stencil3.argtypes = [_f32, _f32, _f32, c_int64, c_int]
 lib.metal_df64_stencil3.restype = c_int
 
@@ -229,6 +231,18 @@ def df64_binop(a, b, op: str = "add"):
     return from_df64(out)
 
 
+def df64_binop_resident(bufA, bufB, bufOut, n: int, op: str = "add"):
+    """Elementwise df64 arithmetic on already-resident DeviceBuffers holding
+    interleaved (hi, lo) pairs. df64 moves 2x the bytes of f32 for the same element
+    count, so the host copies dominate `df64_binop`; use this when data stays put."""
+    if op not in _DF64_OPS:
+        raise ValueError(f"unknown op {op!r}; expected one of {sorted(_DF64_OPS)}")
+    rc = lib.metal_df64_binop_resident(bufA.handle, bufB.handle, bufOut.handle,
+                                       c_int64(n), c_int(_DF64_OPS[op]))
+    if rc:
+        raise RuntimeError(f"metal_df64_binop_resident rc={rc}")
+
+
 def df64_stencil3(x, coef=(1.0, -2.0, 1.0), use_df64: bool = True):
     """3-point stencil out[i] = c0*x[i-1] + c1*x[i] + c2*x[i+1], zero boundaries."""
     n = int(np.asarray(x).size)
@@ -252,7 +266,7 @@ def df64_stencil3(x, coef=(1.0, -2.0, 1.0), use_df64: bool = True):
     return from_df64(out) if use_df64 else out.astype(np.float64)
 
 
-def batched_solve(A, rhs, return_pivmin: bool = False):
+def batched_solve(A, rhs, return_pivmin: bool = False, spd: bool = False):
     """Solve `batch` independent tiny systems A[b] @ x[b] = rhs[b] on the GPU.
 
     A is [batch, n, n] and rhs is [batch, n], n in [2, 8]. Uses LU with partial
@@ -270,13 +284,14 @@ def batched_solve(A, rhs, return_pivmin: bool = False):
     x = np.empty((batch, n), np.float32)
     piv = np.empty(batch, np.float32)
     rc = lib.metal_batched_solve_f32(_ptr(A), _ptr(rhs), _ptr(x), _ptr(piv),
-                                     c_int64(batch), c_int64(n))
+                                     c_int64(batch), c_int64(n), c_int(1 if spd else 0))
     if rc:
         raise RuntimeError(f"metal_batched_solve_f32 rc={rc} (n must be in [2, 8])")
     return (x, piv) if return_pivmin else x
 
 
-def batched_solve_resident(bufA, bufR, bufX, batch: int, n: int, bufP=None):
+def batched_solve_resident(bufA, bufR, bufX, batch: int, n: int, bufP=None,
+                           spd: bool = False):
     """Batched solve on already-resident DeviceBuffers: no host copies.
 
     These kernels do well under one FLOP per byte moved, so the copies in
@@ -285,7 +300,8 @@ def batched_solve_resident(bufA, bufR, bufX, batch: int, n: int, bufP=None):
     """
     rc = lib.metal_batched_solve_resident(bufA.handle, bufR.handle, bufX.handle,
                                           bufP.handle if bufP is not None else None,
-                                          c_int64(batch), c_int64(n))
+                                          c_int64(batch), c_int64(n),
+                                          c_int(1 if spd else 0))
     if rc:
         raise RuntimeError(f"metal_batched_solve_resident rc={rc}")
 

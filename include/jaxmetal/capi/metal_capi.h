@@ -85,14 +85,16 @@ int metal_cholesky_f32(float* A, int64_t n);
 // is faster (2.4x at n=12, 54x at n=32) so hand-writing it would be a pessimisation.
 // pivmin[b] is min|U_kk|/max|U_kk|, or exactly 0 if system b is singular or its input
 // held NaN/Inf -- a singularity flag, NOT a condition estimate. Returns 0 on success.
+// spd=1 selects Cholesky instead of LU: symmetric positive definite A only, reads
+// only the lower triangle, strictly less work (n^3/6 vs n^3/3, no pivoting).
 int metal_batched_solve_f32(const float* A, const float* rhs, float* x, float* pivmin,
-                            int64_t batch, int64_t n);
+                            int64_t batch, int64_t n, int spd);
 
 // Same, on already-resident buffers. These kernels do well under one FLOP per byte
 // moved, so the host copies cost about as much as the solve: use this whenever the
 // data is already on the GPU or is reused across calls. pivmin may be NULL.
 int metal_batched_solve_resident(metal_buffer_t A, metal_buffer_t rhs, metal_buffer_t x,
-                                 metal_buffer_t pivmin, int64_t batch, int64_t n);
+                                 metal_buffer_t pivmin, int64_t batch, int64_t n, int spd);
 
 // Single-threaded CPU reference, same algorithm. The honest benchmark baseline: a
 // plain scalar loop is 3-26x faster than looping numpy.linalg.solve at these sizes.
@@ -105,6 +107,12 @@ void metal_batched_solve_cpu_f32(const float* A, const float* rhs, float* x,
 // unified memory gives the GPU no bandwidth advantage to pay for the emulation.
 // Buffers hold interleaved (hi, lo) f32 pairs, i.e. 2*n floats. op: 0=add 1=mul 2=div.
 int metal_df64_binop(const float* a, const float* b, float* out, int64_t n, int op);
+
+// Same, on already-resident buffers holding interleaved (hi, lo) pairs. df64 moves 2x
+// the bytes of f32 for the same element count, so the host copies dominate the
+// host-operand path; use this whenever the data is already on the GPU.
+int metal_df64_binop_resident(metal_buffer_t a, metal_buffer_t b, metal_buffer_t out,
+                              int64_t n, int op);
 
 // out[i] = c[0]*x[i-1] + c[1]*x[i] + c[2]*x[i+1], zero boundaries. `coef` holds 3
 // df64 values (6 floats). use_df64=0 runs the plain-f32 kernel, in which case x/out

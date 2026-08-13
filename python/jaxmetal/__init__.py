@@ -37,7 +37,8 @@ from . import _capi, mlp as _mlp
 from ._capi import (DeviceBuffer, device_name, library_path, reduce_sum,
                     reduce_sum_resident, cholesky, cholesky_resident,
                     batched_solve, batched_solve_cpu, batched_solve_resident,
-                    df64_binop, df64_stencil3, to_df64, from_df64)
+                    df64_binop, df64_binop_resident, df64_stencil3,
+                    to_df64, from_df64)
 from .mlp import CpuMlp, prefer_gpu
 
 __version__ = "0.6.0"
@@ -48,7 +49,7 @@ __all__ = [
     "DeviceBuffer", "Mlp", "CpuMlp", "prefer_gpu", "MLP_DEVICES",
     "reduce_sum", "reduce_sum_resident", "cholesky", "cholesky_resident",
     "batched_solve", "batched_solve_cpu", "batched_solve_resident",
-    "df64_binop", "df64_stencil3", "to_df64", "from_df64",
+    "df64_binop", "df64_binop_resident", "df64_stencil3", "to_df64", "from_df64",
 ]
 
 MLP_DEVICES = _mlp.DEVICES

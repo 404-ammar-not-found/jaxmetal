@@ -20,7 +20,7 @@ questions, because a feature that cannot answer them is not finished:
 | Feature | Since | Summary |
 |---|---|---|
 | [features/DF64_PRECISION.md](features/DF64_PRECISION.md) | v0.6.0 | Double-single ~48-bit arithmetic on a GPU with no `double` type. 1e7x more accurate than f32 on cancelling work — and slower than the CPU, deliberately shipped as a precision feature only. |
-| [features/BATCHED_SOLVE.md](features/BATCHED_SOLVE.md) | v0.5.0 | Thousands of independent 3x3-8x8 solves, one GPU thread per system, LU with partial pivoting. Up to 14x a scalar C loop when resident (2-3x through the numpy-facing copy path), 15-24x over numpy batched. |
+| [features/BATCHED_SOLVE.md](features/BATCHED_SOLVE.md) | v0.5.0 | Thousands of independent 3x3-8x8 solves, one GPU thread per system, LU with partial pivoting. Up to 14x a scalar C loop when resident, plus an SPD Cholesky path worth a further 2.7x (2-3x through the numpy-facing copy path), 15-24x over numpy batched. |
 | [features/GPU_CHOLESKY.md](features/GPU_CHOLESKY.md) | v0.4.0 | Blocked right-looking Cholesky, one command buffer, MPS GEMM for the trailing update. Parity with direct LAPACK at N=4096, 13× faster than Apple's own MPS Cholesky. Records two refuted optimisations. |
 | [features/COMPENSATED_REDUCTIONS.md](features/COMPENSATED_REDUCTIONS.md) | v0.3.0 | Neumaier f32 summation. 127× more accurate than a tree sum on adversarial input, at no measurable cost. Works around Apple GPUs having no `float64`. |
 | [features/CHUNKED_TRAINING.md](features/CHUNKED_TRAINING.md) | v0.2.0 | Many SGD steps per Metal command buffer. Cut MLP per-step cost ~4.4× and moved the GPU-beats-CPU crossover from batch >2048 to ~60. |

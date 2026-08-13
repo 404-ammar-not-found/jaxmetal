@@ -24,7 +24,7 @@ void register_batched_solve_kernels(KernelLibrary& lib) {
 
 void batched_solve_f32(KernelLibrary& lib, Dispatcher& disp,
                        MetalBuffer& A, MetalBuffer& rhs, MetalBuffer& x,
-                       MetalBuffer& pivmin, int64_t batch, int64_t n) {
+                       MetalBuffer& pivmin, int64_t batch, int64_t n, bool spd) {
   if (n < 2 || n > kBatchedSolveMaxN)
     throw std::runtime_error("batched_solve: n must be in [2, " +
                              std::to_string(kBatchedSolveMaxN) + "]");
@@ -32,7 +32,8 @@ void batched_solve_f32(KernelLibrary& lib, Dispatcher& disp,
 
   // One kernel per size so every index into the register-resident matrix is a
   // compile-time constant; see the header comment in kernels/batched_solve.metal.
-  void* pso = lib.pipeline(("batched_solve_" + std::to_string(n)).c_str());
+  void* pso = lib.pipeline(((spd ? "batched_chol_" : "batched_solve_") +
+                            std::to_string(n)).c_str());
   BSolveDims d{static_cast<uint32_t>(batch)};
   std::vector<MetalBuffer*> bufs = {&A, &rhs, &x, &pivmin};
   disp.dispatch_1d(pso, bufs, batch, &d, sizeof(d));

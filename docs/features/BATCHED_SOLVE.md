@@ -101,6 +101,25 @@ machinery. A plain scalar C loop is the honest bar.
 **Residency is worth ~2.4×** — these kernels do well under one FLOP per byte moved, so
 the host copies cost about as much as the solve.
 
+### `spd=True`: Cholesky for symmetric positive definite systems
+
+Strictly less work than LU — `n³/6` against `n³/3` — and, more importantly here, **no
+pivot search and no row interchange at all**. The conditional-swap sequence is a large
+part of the LU kernel's instruction stream, so removing it gains more than the FLOP
+count suggests. Resident, batch = 65,536:
+
+| n | 2 | 3 | 4 | 6 | 8 |
+|---|---:|---:|---:|---:|---:|
+| Cholesky vs LU | 0.97× | 1.27× | 1.69× | **2.69×** | **2.63×** |
+
+Residual improves too (4.0e-08 against LU's ~1.7e-07). At n=2 there is nothing to save
+and the extra triangular masking costs 3%.
+
+Only the **lower triangle** of `A` is read, so the upper may hold anything —
+`BatchedCholeskyIgnoresUpperTriangle` fills it with `1e30` and asserts the result is
+bit-identical, which a symmetric test matrix could never detect. `pivmin` keeps the
+same contract: exactly `0.0` for a non-SPD, singular, or NaN input.
+
 ### Crossover (n = 6)
 
 | batch | GPU host | GPU resident | C loop | numpy | host wins | resident wins |
@@ -122,8 +141,7 @@ than the entire solve.
 - **`batched_solve_resident` takes `DeviceBuffer`s directly**; the numpy-facing
   `batched_solve` copies in and out and is ~2.4× slower. Use the resident path when
   data is already on the device or reused across calls.
-- **No batched Cholesky.** The SPD case would save roughly half the work; it is a
-  mechanical variant of the same kernel.
+- **`spd=True` selects Cholesky** for symmetric positive definite systems.
 - **f32 only.** Apple GPUs have no f64. Forward error tracks `cond · eps_f32`, so
   systems with cond ≳ 1e4 want the CPU regardless of throughput.
 - **No `auto` router.** [DEVICE_ROUTING.md](DEVICE_ROUTING.md) has the machinery and

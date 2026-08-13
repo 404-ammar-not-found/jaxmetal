@@ -122,6 +122,110 @@ inline void lu_solve_impl(device const float* A,
     pivmin[sys] = (bad || !(umax > 0.0f)) ? 0.0f : (umin / umax);
 }
 
+// ---- SPD variant: Cholesky instead of LU ---------------------------------------
+//
+// For symmetric positive definite systems this is strictly less work than the LU path
+// above: n^3/6 for the factorisation against n^3/3, and no pivot search or row
+// interchange at all -- which matters more than the FLOP count here, because the
+// conditional-swap sequence is a large part of the LU kernel's instruction stream.
+//
+// Only the LOWER triangle of A is read. That is deliberate: it means a caller can pass
+// a matrix whose upper triangle holds anything, and it is what BatchedCholeskyIgnores
+// UpperTriangle pins down.
+template <uint N>
+inline void chol_solve_impl(device const float* A,
+                            device const float* Rhs,
+                            device float*       X,
+                            device float*       pivmin,
+                            uint sys) {
+    float a[N * N];
+    float b[N];
+
+    #pragma unroll
+    for (uint i = 0; i < N; ++i) {
+        #pragma unroll
+        for (uint j = 0; j < N; ++j)
+            a[i * N + j] = (j <= i) ? A[(ulong)sys * N * N + i * N + j] : 0.0f;
+        b[i] = Rhs[(ulong)sys * N + i];
+    }
+
+    // Factor A = L*L^T in place, lower triangle.
+    bool bad = false;
+    float dmin = INFINITY, dmax = 0.0f;
+    #pragma unroll
+    for (uint k = 0; k < N; ++k) {
+        float d = a[k * N + k];
+        #pragma unroll
+        for (uint p = 0; p < N; ++p)
+            if (p < k) d -= a[k * N + p] * a[k * N + p];
+
+        // !(d > 0) is true for NaN, zero and negative alike -- the only form that
+        // catches all three. min()/max() would be fmin/fmax and would DROP a NaN,
+        // reporting perfect health for an all-NaN answer.
+        bad = bad || !(d > 0.0f);
+        dmin = (d < dmin) ? d : dmin;
+        dmax = (d > dmax) ? d : dmax;
+        const float lkk = sqrt(bad ? 1.0f : d);
+        a[k * N + k] = lkk;
+
+        #pragma unroll
+        for (uint i = 0; i < N; ++i) {
+            if (i > k) {
+                float s = a[i * N + k];
+                #pragma unroll
+                for (uint p = 0; p < N; ++p)
+                    if (p < k) s -= a[i * N + p] * a[k * N + p];
+                a[i * N + k] = s / lkk;
+            }
+        }
+    }
+
+    // Forward: L y = b.
+    #pragma unroll
+    for (uint i = 0; i < N; ++i) {
+        float s = b[i];
+        #pragma unroll
+        for (uint p = 0; p < N; ++p)
+            if (p < i) s -= a[i * N + p] * b[p];
+        b[i] = s / a[i * N + i];
+    }
+    // Backward: L^T x = y.
+    #pragma unroll
+    for (int i = int(N) - 1; i >= 0; --i) {
+        float s = b[uint(i)];
+        #pragma unroll
+        for (uint p = 0; p < N; ++p)
+            if (p > uint(i)) s -= a[p * N + uint(i)] * b[p];
+        b[uint(i)] = s / a[uint(i) * N + uint(i)];
+    }
+
+    #pragma unroll
+    for (uint i = 0; i < N; ++i) X[(ulong)sys * N + i] = b[i];
+
+    // Same contract as the LU path: ratio of extreme pivots, or exactly 0 for a
+    // non-SPD or NaN/Inf input. Accumulated pre-sqrt so a negative pivot is visible.
+    pivmin[sys] = (bad || !(dmax > 0.0f)) ? 0.0f : (dmin / dmax);
+}
+
+#define DEFINE_BATCHED_CHOL(N)                                               \
+kernel void batched_chol_##N(device const float* A      [[buffer(0)]],       \
+                             device const float* Rhs    [[buffer(1)]],       \
+                             device float*       X      [[buffer(2)]],       \
+                             device float*       pivmin [[buffer(3)]],       \
+                             constant BSolveDims& d     [[buffer(4)]],       \
+                             uint gid [[thread_position_in_grid]]) {         \
+    if (gid >= d.batch) return;                                              \
+    chol_solve_impl<N>(A, Rhs, X, pivmin, gid);                              \
+}
+
+DEFINE_BATCHED_CHOL(2)
+DEFINE_BATCHED_CHOL(3)
+DEFINE_BATCHED_CHOL(4)
+DEFINE_BATCHED_CHOL(5)
+DEFINE_BATCHED_CHOL(6)
+DEFINE_BATCHED_CHOL(7)
+DEFINE_BATCHED_CHOL(8)
+
 #define DEFINE_BATCHED_SOLVE(N)                                              \
 kernel void batched_solve_##N(device const float* A      [[buffer(0)]],      \
                               device const float* Rhs    [[buffer(1)]],      \

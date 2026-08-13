@@ -41,14 +41,14 @@ KernelLibrary& bs_lib() {
 struct Result { std::vector<float> x, pivmin; };
 
 Result run(const std::vector<float>& A, const std::vector<float>& rhs,
-           int64_t batch, int64_t n) {
+           int64_t batch, int64_t n, bool spd = false) {
   MetalContext& ctx = testutil::ctx();
   Dispatcher disp(ctx);
   auto dA = ctx.from_host(A.data(), {batch, n, n}, DType::F32);
   auto dR = ctx.from_host(rhs.data(), {batch, n}, DType::F32);
   auto dX = ctx.alloc({batch, n}, DType::F32);
   auto dP = ctx.alloc({batch}, DType::F32);
-  batched_solve_f32(bs_lib(), disp, *dA, *dR, *dX, *dP, batch, n);
+  batched_solve_f32(bs_lib(), disp, *dA, *dR, *dX, *dP, batch, n, spd);
   disp.wait();
   const float* xp = static_cast<const float*>(dX->contents());
   const float* pp = static_cast<const float*>(dP->contents());
@@ -191,6 +191,78 @@ TEST(BatchedSolveResidentMatchesHostPath) {
 
   const float* xp = static_cast<const float*>(dX->contents());
   for (int64_t i = 0; i < batch * n; ++i) CHECK(xp[i] == host.x[(size_t)i]);
+}
+
+// Batched SPD: A = M*M^T + n*I, so genuinely positive definite. Cholesky and LU solve
+// the same system, so they must agree; Cholesky should be at least as accurate.
+TEST(BatchedCholeskyMatchesLU) {
+  const int64_t batch = 2048;
+  for (int64_t n = 2; n <= kBatchedSolveMaxN; ++n) {
+    auto M = randv((size_t)(batch * n * n), (uint32_t)(500 + n));
+    std::vector<float> A((size_t)(batch * n * n), 0.0f);
+    for (int64_t s = 0; s < batch; ++s)
+      for (int64_t i = 0; i < n; ++i)
+        for (int64_t j = 0; j < n; ++j) {
+          double acc = 0.0;
+          for (int64_t p = 0; p < n; ++p)
+            acc += (double)M[(size_t)(s * n * n + i * n + p)] *
+                   (double)M[(size_t)(s * n * n + j * n + p)];
+          A[(size_t)(s * n * n + i * n + j)] = (float)acc + (i == j ? (float)n : 0.0f);
+        }
+    auto rhs = randv((size_t)(batch * n), (uint32_t)(600 + n));
+
+    auto chol = run(A, rhs, batch, n, /*spd=*/true);
+    auto lu = run(A, rhs, batch, n, /*spd=*/false);
+    CHECK(worst_residual(A, rhs, chol.x, batch, n) < 1e-5);
+    for (int64_t s = 0; s < batch; ++s) CHECK(chol.pivmin[(size_t)s] > 0.0f);
+
+    double worst = 0.0;
+    for (size_t i = 0; i < chol.x.size(); ++i)
+      worst = std::max(worst, (double)std::abs(chol.x[i] - lu.x[i]));
+    CHECK(worst < 1e-3);
+  }
+}
+
+// The Cholesky path documents that it reads ONLY the lower triangle. Filling the upper
+// triangle with garbage must therefore change nothing. A symmetric test matrix could
+// not detect a transposed read; this can.
+TEST(BatchedCholeskyIgnoresUpperTriangle) {
+  const int64_t n = 6, batch = 256;
+  std::vector<float> A((size_t)(batch * n * n), 0.0f);
+  for (int64_t s = 0; s < batch; ++s)
+    for (int64_t i = 0; i < n; ++i)
+      for (int64_t j = 0; j <= i; ++j)
+        A[(size_t)(s * n * n + i * n + j)] = (i == j) ? (float)(n + i) : 0.25f;
+  auto rhs = randv((size_t)(batch * n), 42);
+  auto clean = run(A, rhs, batch, n, /*spd=*/true);
+
+  auto dirty_A = A;
+  for (int64_t s = 0; s < batch; ++s)
+    for (int64_t i = 0; i < n; ++i)
+      for (int64_t j = i + 1; j < n; ++j)
+        dirty_A[(size_t)(s * n * n + i * n + j)] = 1e30f;   // garbage above the diagonal
+  auto dirty = run(dirty_A, rhs, batch, n, /*spd=*/true);
+
+  for (size_t i = 0; i < clean.x.size(); ++i) CHECK(clean.x[i] == dirty.x[i]);
+}
+
+// Non-SPD and NaN must both drive pivmin to exactly zero, same contract as the LU path.
+TEST(BatchedCholeskyFlagsNonSPD) {
+  const int64_t n = 4, batch = 4;
+  std::vector<float> A((size_t)(batch * n * n), 0.0f), rhs((size_t)(batch * n), 1.0f);
+  auto setI = [&](int64_t s, float d) {
+    for (int64_t i = 0; i < n; ++i) A[(size_t)(s * n * n + i * n + i)] = d;
+  };
+  setI(0, 2.0f);                                            // 0: SPD
+  setI(1, 2.0f); A[(size_t)(1 * n * n)] = -1.0f;            // 1: negative pivot
+  /* 2: all zeros -> singular */
+  setI(3, 2.0f); A[(size_t)(3 * n * n)] = std::nanf("");    // 3: NaN
+
+  auto r = run(A, rhs, batch, n, /*spd=*/true);
+  CHECK(r.pivmin[0] > 0.0f);
+  CHECK(r.pivmin[1] == 0.0f);
+  CHECK(r.pivmin[2] == 0.0f);
+  CHECK(r.pivmin[3] == 0.0f);
 }
 
 // Sizes outside the supported range must fail loudly rather than silently doing

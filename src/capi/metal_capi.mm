@@ -258,7 +258,7 @@ KernelLibrary& batched_solve_lib() {
 }  // namespace
 
 int metal_batched_solve_f32(const float* A, const float* rhs, float* x, float* pivmin,
-                            int64_t batch, int64_t n) {
+                            int64_t batch, int64_t n, int spd) {
   if (!A || !rhs || !x) return 2;
   try {
     MetalContext& ctx = MetalContext::instance();
@@ -267,7 +267,7 @@ int metal_batched_solve_f32(const float* A, const float* rhs, float* x, float* p
     auto dR = ctx.from_host(rhs, {batch, n}, DType::F32);
     auto dX = ctx.alloc({batch, n}, DType::F32);
     auto dP = ctx.alloc({batch}, DType::F32);
-    batched_solve_f32(batched_solve_lib(), disp, *dA, *dR, *dX, *dP, batch, n);
+    batched_solve_f32(batched_solve_lib(), disp, *dA, *dR, *dX, *dP, batch, n, spd != 0);
     disp.wait();
     std::memcpy(x, dX->contents(), sizeof(float) * (size_t)(batch * n));
     if (pivmin) std::memcpy(pivmin, dP->contents(), sizeof(float) * (size_t)batch);
@@ -278,7 +278,8 @@ int metal_batched_solve_f32(const float* A, const float* rhs, float* x, float* p
 }
 
 int metal_batched_solve_resident(metal_buffer_t A, metal_buffer_t rhs, metal_buffer_t x,
-                                 metal_buffer_t pivmin, int64_t batch, int64_t n) {
+                                 metal_buffer_t pivmin, int64_t batch, int64_t n,
+                                 int spd) {
   if (!A || !rhs || !x) return 2;
   try {
     MetalContext& ctx = MetalContext::instance();
@@ -294,7 +295,7 @@ int metal_batched_solve_resident(metal_buffer_t A, metal_buffer_t rhs, metal_buf
         scratch = ctx.alloc({batch}, DType::F32);
     }
     batched_solve_f32(batched_solve_lib(), disp, *dA, *dR, *dX,
-                      dP ? **dP : *scratch, batch, n);
+                      dP ? **dP : *scratch, batch, n, spd != 0);
     disp.wait();
     return 0;
   } catch (...) {
@@ -330,6 +331,23 @@ int metal_df64_binop(const float* a, const float* b, float* out, int64_t n, int 
     df64_elementwise(df64_lib(), disp, o, *da, *db, *dout, n);
     disp.wait();
     std::memcpy(out, dout->contents(), sizeof(float) * (size_t)(n * 2));
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+
+int metal_df64_binop_resident(metal_buffer_t a, metal_buffer_t b, metal_buffer_t out,
+                              int64_t n, int op) {
+  if (!a || !b || !out) return 2;
+  try {
+    Dispatcher disp(MetalContext::instance());
+    auto& da = *static_cast<BufferHandle*>(a);
+    auto& db = *static_cast<BufferHandle*>(b);
+    auto& dout = *static_cast<BufferHandle*>(out);
+    const DF64Op o = op == 1 ? DF64Op::Mul : (op == 2 ? DF64Op::Div : DF64Op::Add);
+    df64_elementwise(df64_lib(), disp, o, *da, *db, *dout, n);
+    disp.wait();
     return 0;
   } catch (...) {
     return 1;

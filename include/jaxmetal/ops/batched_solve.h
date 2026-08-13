@@ -28,9 +28,13 @@ constexpr int64_t kBatchedSolveMaxN = 8;
 // system scores 1.0 while its answer is inaccurate.
 //
 // Throws if n < 2 or n > kBatchedSolveMaxN. Does not wait; the caller synchronises.
+// `spd=true` selects Cholesky instead of LU: valid only for symmetric positive
+// definite A, reads only the lower triangle, and is strictly less work (n^3/6 vs
+// n^3/3, and no pivot search or row interchange).
 void batched_solve_f32(KernelLibrary& lib, Dispatcher& disp,
                        MetalBuffer& A, MetalBuffer& rhs, MetalBuffer& x,
-                       MetalBuffer& pivmin, int64_t batch, int64_t n);
+                       MetalBuffer& pivmin, int64_t batch, int64_t n,
+                       bool spd = false);
 
 // Single-threaded CPU reference: the same algorithm, scalar, one system at a time.
 // This is the honest baseline for the benchmark -- a plain C loop is 3-26x faster
