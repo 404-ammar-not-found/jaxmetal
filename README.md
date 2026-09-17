@@ -22,13 +22,6 @@ CPU** (Accelerate/AMX). The speedup comes from two design decisions: all tensors
 GPU-resident across steps, and many consecutive SGD steps are encoded into a single Metal
 command buffer, so the driver round trip is paid once per chunk rather than once per step.
 
-<table>
-<tr>
-<td width="50%"><img src="docs/images/training_curve.svg" alt="MNIST test accuracy per epoch, reaching 98.15%"></td>
-<td width="50%"><img src="docs/images/benchmark.svg" alt="Resident GPU MLP step versus JAX CPU speedup across batch sizes"></td>
-</tr>
-</table>
-
 ## Capabilities
 
 - **End-to-end GPU training.** Resident forward pass, backward pass, and SGD update, with many
